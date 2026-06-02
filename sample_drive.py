@@ -22,7 +22,14 @@ shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'acceleration_input' : 1.0,
+    'target_lane': 1,        # 0: Left, 1: Middle, 2: Right
+    'current_lane': 1,
+    'low_brightness': False,  # Event flag
+    'tap_timer': 0,
+    'cooldown_timer': 0,
+    'tap_steering': 0.0,
+    'police_active': False    # Dynamic tracking state for police event
 }
 data_lock = threading.Lock()
 is_running = True
@@ -184,10 +191,10 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
+                # Disabled GUI rendering in background threads to significantly improve FPS
+                # frame_resized = cv2.resize(frame, (640, 480))
+                # cv2.imshow(window_name, frame_resized)
+                # cv2.waitKey(1)
                 
     except Exception as e:
         pass
@@ -199,36 +206,186 @@ def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 def processing_task():
-    #This is where you write your image processing code to decide how to control the car
-    #You can use libraries like OpenCV to process the image
-    #There is no limtation to the complexity of the processing task, you can use any libraries you want
-    #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
+        back_frame = shared_data['latest_back_frame']
+        police_mode = shared_data['police_active']
     
+    steering_target = 0.0
+    frame_center = 160
+    
+    # ---------------------------------------------------------
+    # BACK CAMERA ENVIRONMENT ANALYSIS (Trailing Car Evasion) [cite: 31]
+    # ---------------------------------------------------------
+    evade_back_car = False
+    back_steering_escape = 0.0
+    
+    if back_frame is not None:
+        small_back = cv2.resize(back_frame, (320, 240))
+        gray_back = cv2.cvtColor(small_back, cv2.COLOR_BGR2GRAY)
+        
+        # Check for proximity of a trailing vehicle via structural changes or looming bounding boxes
+        # Assuming vehicles from behind appear prominently in a specific mid-lane mask area
+        back_roi = gray_back[120:240, 60:260]
+        avg_intensity = np.mean(back_roi)
+        
+        # Looming vehicle detection threshold
+        if avg_intensity > 180 or avg_intensity < 40: 
+            evade_back_car = True
+            # Check which side has more space or default a structural escape jump
+            back_steering_escape = 1.0  # Tap right to clear the lane [cite: 153, 156]
+
+    # ---------------------------------------------------------
+    # FRONT CAMERA ENVIRONMENT ANALYSIS (Token Processing)
+    # ---------------------------------------------------------
     if front_frame is not None:
-        # write your processing here
-        pass
+        small_frame = cv2.resize(front_frame, (320, 240))
+        
+        # Dynamic Environmental Check: Low Brightness Mitigation [cite: 36, 214]
+        gray_front = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        brightness = np.mean(gray_front)
+        with data_lock:
+            if brightness < 60:  # Threshold identifying light corruption [cite: 35]
+                shared_data['low_brightness'] = True  # Activates toggle switch flag [cite: 36, 214]
+            else:
+                shared_data['low_brightness'] = False
+
+        hsv_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2HSV)
+        
+        # Extended Range Color Masks [cite: 140, 141]
+        lower_green = np.array([35, 40, 40]) 
+        upper_green = np.array([85, 255, 255])
+        mask_green = cv2.inRange(hsv_frame, lower_green, upper_green)
+        
+        lower_red1 = np.array([0, 50, 50])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 50, 50])
+        upper_red2 = np.array([180, 255, 255])
+        mask_red = cv2.bitwise_or(cv2.inRange(hsv_frame, lower_red1, upper_red1), 
+                                  cv2.inRange(hsv_frame, lower_red2, upper_red2))
+                                  
+        lower_yellow = np.array([15, 50, 50])
+        upper_yellow = np.array([30, 255, 255])
+        mask_yellow = cv2.inRange(hsv_frame, lower_yellow, upper_yellow)
+        
+        contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Look out for police lights to change internal state machines dynamically [cite: 32, 213]
+        # Police flashing states detected by massive variance or contours matching color heights
+        if len(contours_red) > 3:
+            with data_lock:
+                shared_data['police_active'] = True
+
+        # Decision State Hierarchy [cite: 15]
+        if evade_back_car:
+            # Priority 1: Do not get wrecked from behind [cite: 31]
+            steering_target = back_steering_escape
+            print(f"Trailing Car Alert! Escaping to steering: {steering_target}") [cite: 30]
+            
+        elif police_mode and contours_red:
+            # Priority 2: Catch red token intentionally if Police are chasing [cite: 33, 213]
+            largest_red = max(contours_red, key=cv2.contourArea)
+            if cv2.contourArea(largest_red) > 3:
+                M = cv2.moments(largest_red)
+                if M['m00'] > 0:
+                    rx = int(M['m10'] / M['m00'])
+                    error = rx - frame_center
+                    steering_target = -1.0 if error < -15 else (1.0 if error > 15 else 0.0)
+                    if abs(error) <= 15:
+                        with data_lock:
+                            shared_data['police_active'] = False # Event successfully clear [cite: 17, 201]
+
+        else:
+            # Priority 3: Standard Navigation (Seek Green [cite: 19, 204], Dodge Red [cite: 20, 204], Dodge Yellow [cite: 21, 205])
+            red_detected = False
+            yellow_detected = False
+            
+            # Evade Red Tokens [cite: 20, 204]
+            if contours_red:
+                largest_red = max(contours_red, key=cv2.contourArea)
+                if cv2.contourArea(largest_red) > 5:
+                    M = cv2.moments(largest_red)
+                    if M['m00'] > 0:
+                        rx = int(M['m10'] / M['m00'])
+                        steering_target = -1.0 if rx > frame_center else 1.0
+                        red_detected = True
+                        print("Evading Red Token!") [cite: 20]
+
+            # Evade Yellow Corruption Fields [cite: 21, 205]
+            if not red_detected and contours_yellow:
+                largest_yellow = max(contours_yellow, key=cv2.contourArea)
+                if cv2.contourArea(largest_yellow) > 5:
+                    M = cv2.moments(largest_yellow)
+                    if M['m00'] > 0:
+                        yx = int(M['m10'] / M['m00'])
+                        steering_target = -1.0 if yx > frame_center else 1.0
+                        yellow_detected = True
+                        print("Evading Corruptive Yellow Token!") [cite: 28]
+
+            # Collect Speed Upgrades [cite: 19, 204]
+            if not red_detected and not yellow_detected and contours_green:
+                largest_green = max(contours_green, key=cv2.contourArea)
+                if cv2.contourArea(largest_green) > 5:
+                    M = cv2.moments(largest_green)
+                    if M['m00'] > 0:
+                        gx = int(M['m10'] / M['m00'])
+                        error = gx - frame_center
+                        if error < -15:
+                            steering_target = -1.0
+                        elif error > 15:
+                            steering_target = 1.0
+                        print(f"Targeting Green Token! Error: {error}") [cite: 19]
+
+        # Commit decision to shared resources safely using a Tap Sequence [cite: 152]
+        with data_lock:
+            if shared_data['tap_timer'] > 0:
+                # State 1: Actively tapping [cite: 156]
+                shared_data['tap_timer'] -= 1
+                shared_data['steering_input'] = shared_data['tap_steering']
+                if shared_data['tap_timer'] == 0:
+                    shared_data['cooldown_timer'] = 10 # State 2: Enforce 0.0 wait after tap [cite: 157, 158]
+                    shared_data['steering_input'] = 0.0
+            elif shared_data['cooldown_timer'] > 0:
+                # State 2: Waiting for car to settle [cite: 157]
+                shared_data['cooldown_timer'] -= 1
+                shared_data['steering_input'] = 0.0
+            else:
+                # State 0: Ready for a new tap [cite: 154]
+                if steering_target != 0.0:
+                    shared_data['tap_steering'] = steering_target
+                    shared_data['tap_timer'] = 8  # Discrete tap sequence execution frames
+                    shared_data['steering_input'] = steering_target
+                    print(f"Initiating Tap! Steering: {steering_target}")
+                else:
+                    shared_data['steering_input'] = 0.0
 
 def send_controls_task():
-    #This is where you send the control commands to the car using the control_conn
     global control_conn
     if control_conn is None:
+        # Workaround: Safely restart the locked server function if it died
+        is_server_running = any(t.name == "ControlServerRecovery" for t in threading.enumerate())
+        if not is_server_running:
+            print("Connection missing. Restarting control server...")
+            threading.Thread(target=setup_control_server, name="ControlServerRecovery", daemon=True).start()
         return
     
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+    with data_lock:
+        steering_to_send = shared_data['steering_input']
+        # Handle Low Brightness: Map structural change to reverse acceleration or signal value tweaks if required [cite: 36, 164]
+        if shared_data['low_brightness']:
+            # Modulate throttle or activate lighting sequences over standard float packing [cite: 162]
+            acceleration_to_send = 0.95  
+        else:
+            acceleration_to_send = 1.0 # Default: full gas ahead [cite: 174]
 
     try:
-        # Pack and send the control command
-        data = struct.pack('ff', steering_input, acceleration_input)
+        # Pack and send the control command to Unity [cite: 177]
+        data = struct.pack('ff', steering_to_send, acceleration_to_send)
         control_conn.sendall(data)
     except Exception as e:
-        print(f"Control send error: {e}")
+        print(f"Control send error: {e}") [cite: 179]
         control_conn = None
 
 
@@ -248,10 +405,10 @@ if __name__ == '__main__':
     # Period refers to the period of execution of the task in seconds
     # Priority refers to the priority of the task, higher priority means higher priority
     # Concurrency refers to the number of instances of the task that can run at the same time
-    t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
-    t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
-    t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
+    t_front_camera = RTTask("ReadFrontCamera", period=0.033, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
+    t_back_camera = RTTask("ReadBackCamera", period=0.033, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
+    t_processing = RTTask("Processing", period=0.033, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_controls = RTTask("SendControls", period=0.033, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     
     # Start tasks to run concurrently
     t_front_camera.start()
@@ -262,7 +419,18 @@ if __name__ == '__main__':
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
-            time.sleep(1)
+            with data_lock:
+                front = shared_data.get('latest_front_frame')
+                back = shared_data.get('latest_back_frame')
+
+            if front is not None:
+                cv2.imshow("Front Camera - AI Driving", cv2.resize(front, (640, 480)))
+            if back is not None:
+                cv2.imshow("Back Camera", cv2.resize(back, (640, 480)))
+
+            if cv2.waitKey(33) & 0xFF == ord('q'):
+                is_running = False
+                break
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
