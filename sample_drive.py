@@ -282,7 +282,7 @@ def processing_task():
         if evade_back_car:
             # Priority 1: Do not get wrecked from behind [cite: 31]
             steering_target = back_steering_escape
-            print(f"Trailing Car Alert! Escaping to steering: {steering_target}") [cite: 30]
+            print(f"Trailing Car Alert! Escaping to steering: {steering_target}") 
             
         elif police_mode and contours_red:
             # Priority 2: Catch red token intentionally if Police are chasing [cite: 33, 213]
@@ -311,7 +311,7 @@ def processing_task():
                         rx = int(M['m10'] / M['m00'])
                         steering_target = -1.0 if rx > frame_center else 1.0
                         red_detected = True
-                        print("Evading Red Token!") [cite: 20]
+                        print("Evading Red Token!")
 
             # Evade Yellow Corruption Fields [cite: 21, 205]
             if not red_detected and contours_yellow:
@@ -322,7 +322,7 @@ def processing_task():
                         yx = int(M['m10'] / M['m00'])
                         steering_target = -1.0 if yx > frame_center else 1.0
                         yellow_detected = True
-                        print("Evading Corruptive Yellow Token!") [cite: 28]
+                        print("Evading Corruptive Yellow Token!") 
 
             # Collect Speed Upgrades [cite: 19, 204]
             if not red_detected and not yellow_detected and contours_green:
@@ -336,7 +336,7 @@ def processing_task():
                             steering_target = -1.0
                         elif error > 15:
                             steering_target = 1.0
-                        print(f"Targeting Green Token! Error: {error}") [cite: 19]
+                        print(f"Targeting Green Token! Error: {error}") 
 
         # Commit decision to shared resources safely using a Tap Sequence [cite: 152]
         with data_lock:
@@ -385,7 +385,7 @@ def send_controls_task():
         data = struct.pack('ff', steering_to_send, acceleration_to_send)
         control_conn.sendall(data)
     except Exception as e:
-        print(f"Control send error: {e}") [cite: 179]
+        print(f"Control send error: {e}") 
         control_conn = None
 
 
