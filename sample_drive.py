@@ -29,7 +29,9 @@ shared_data = {
     'tap_timer': 0,
     'cooldown_timer': 0,
     'tap_steering': 0.0,
-    'police_active': False    # Dynamic tracking state for police event
+    'police_active': False,   # Dynamic tracking state for police event
+    'red_detect_count': 0,
+    'yellow_detect_count': 0
 }
 data_lock = threading.Lock()
 is_running = True
@@ -228,9 +230,10 @@ def processing_task():
         # Assuming vehicles from behind appear prominently in a specific mid-lane mask area
         back_roi = gray_back[120:240, 60:260]
         avg_intensity = np.mean(back_roi)
+        contrast = np.std(back_roi)
         
-        # Looming vehicle detection threshold
-        if avg_intensity > 180 or avg_intensity < 40: 
+        # Brightness alone was too sensitive, so require stronger brightness + contrast.
+        if (avg_intensity > 225 or avg_intensity < 25) and contrast > 18:
             evade_back_car = True
             # Check which side has more space or default a structural escape jump
             back_steering_escape = 1.0  # Tap right to clear the lane [cite: 153, 156]
@@ -272,22 +275,16 @@ def processing_task():
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Look out for police lights to change internal state machines dynamically [cite: 32, 213]
-        # Police flashing states detected by massive variance or contours matching color heights
-        if len(contours_red) > 3:
-            with data_lock:
-                shared_data['police_active'] = True
-
         # Decision State Hierarchy [cite: 15]
         if evade_back_car:
             # Priority 1: Do not get wrecked from behind [cite: 31]
             steering_target = back_steering_escape
-            print(f"Trailing Car Alert! Escaping to steering: {steering_target}") 
+            print(f"Trailing Car Alert! Escaping to steering: {steering_target}")
             
         elif police_mode and contours_red:
             # Priority 2: Catch red token intentionally if Police are chasing [cite: 33, 213]
             largest_red = max(contours_red, key=cv2.contourArea)
-            if cv2.contourArea(largest_red) > 3:
+            if cv2.contourArea(largest_red) > 5:
                 M = cv2.moments(largest_red)
                 if M['m00'] > 0:
                     rx = int(M['m10'] / M['m00'])
@@ -305,36 +302,66 @@ def processing_task():
             # Evade Red Tokens [cite: 20, 204]
             if contours_red:
                 largest_red = max(contours_red, key=cv2.contourArea)
-                if cv2.contourArea(largest_red) > 5:
-                    M = cv2.moments(largest_red)
-                    if M['m00'] > 0:
-                        rx = int(M['m10'] / M['m00'])
-                        steering_target = -1.0 if rx > frame_center else 1.0
-                        red_detected = True
-                        print("Evading Red Token!")
+                rx, ry, rw, rh = cv2.boundingRect(largest_red)
+                red_bottom = ry + rh
+                red_area = cv2.contourArea(largest_red)
+
+                if red_area > 5 and red_bottom > 60:
+                    with data_lock:
+                        shared_data['red_detect_count'] += 1
+
+                    if shared_data['red_detect_count'] >= 2:
+                        M = cv2.moments(largest_red)
+                        if M['m00'] > 0:
+                            rx = int(M['m10'] / M['m00'])
+                            steering_target = -1.0 if rx > frame_center else 1.0
+                            red_detected = True
+                            print("Evading Red Token Early!")
+                else:
+                    with data_lock:
+                        shared_data['red_detect_count'] = 0
+            else:
+                with data_lock:
+                    shared_data['red_detect_count'] = 0
 
             # Evade Yellow Corruption Fields [cite: 21, 205]
             if not red_detected and contours_yellow:
                 largest_yellow = max(contours_yellow, key=cv2.contourArea)
-                if cv2.contourArea(largest_yellow) > 5:
-                    M = cv2.moments(largest_yellow)
-                    if M['m00'] > 0:
-                        yx = int(M['m10'] / M['m00'])
-                        steering_target = -1.0 if yx > frame_center else 1.0
-                        yellow_detected = True
-                        print("Evading Corruptive Yellow Token!") 
+                yx, yy, yw, yh = cv2.boundingRect(largest_yellow)
+                yellow_bottom = yy + yh
+                yellow_area = cv2.contourArea(largest_yellow)
+
+                if yellow_area > 5 and yellow_bottom > 60:
+                    with data_lock:
+                        shared_data['yellow_detect_count'] += 1
+
+                    if shared_data['yellow_detect_count'] >= 2:
+                        M = cv2.moments(largest_yellow)
+                        if M['m00'] > 0:
+                            yx = int(M['m10'] / M['m00'])
+                            steering_target = -1.0 if yx > frame_center else 1.0
+                            yellow_detected = True
+                            print("Evading Corruptive Yellow Token Early!")
+                else:
+                    with data_lock:
+                        shared_data['yellow_detect_count'] = 0
+            else:
+                with data_lock:
+                    shared_data['yellow_detect_count'] = 0
 
             # Collect Speed Upgrades [cite: 19, 204]
             if not red_detected and not yellow_detected and contours_green:
                 largest_green = max(contours_green, key=cv2.contourArea)
-                if cv2.contourArea(largest_green) > 5:
+                gx, gy, gw, gh = cv2.boundingRect(largest_green)
+                green_bottom = gy + gh
+                if cv2.contourArea(largest_green) > 35 and green_bottom > 105:
                     M = cv2.moments(largest_green)
                     if M['m00'] > 0:
                         gx = int(M['m10'] / M['m00'])
                         error = gx - frame_center
-                        if error < -15:
+                        if error < -35:
                             steering_target = -1.0
-                        elif error > 15:
+                        elif error > 35:
                             steering_target = 1.0
                         print(f"Targeting Green Token! Error: {error}") 
 
@@ -355,7 +382,7 @@ def processing_task():
                 # State 0: Ready for a new tap [cite: 154]
                 if steering_target != 0.0:
                     shared_data['tap_steering'] = steering_target
-                    shared_data['tap_timer'] = 8  # Discrete tap sequence execution frames
+                    shared_data['tap_timer'] = 12  # Discrete tap sequence execution frames
                     shared_data['steering_input'] = steering_target
                     print(f"Initiating Tap! Steering: {steering_target}")
                 else:
