@@ -270,6 +270,22 @@ def processing_task():
         lower_yellow = np.array([15, 50, 50])
         upper_yellow = np.array([30, 255, 255])
         mask_yellow = cv2.inRange(hsv_frame, lower_yellow, upper_yellow)
+
+        # Road Region of Interest (ROI): only detect tokens inside the visible road.
+        # The polygon is tuned for the resized 320 x 240 front-camera frame.
+        road_mask = np.zeros((240, 320), dtype=np.uint8)
+        road_polygon = np.array([
+            [40, 239],
+            [280, 239],
+            [205, 70],
+            [115, 70]
+        ], dtype=np.int32)
+        cv2.fillPoly(road_mask, [road_polygon], 255)
+
+        # Apply the road ROI before contour detection so off-road colors are ignored.
+        mask_green = cv2.bitwise_and(mask_green, road_mask)
+        mask_red = cv2.bitwise_and(mask_red, road_mask)
+        mask_yellow = cv2.bitwise_and(mask_yellow, road_mask)
         
         contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
