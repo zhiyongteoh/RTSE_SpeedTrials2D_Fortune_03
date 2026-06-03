@@ -291,6 +291,42 @@ def processing_task():
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # Select the most relevant token instead of blindly choosing
+        # the largest contour. Nearby tokens and tokens closer to the
+        # vehicle's driving path receive a higher score.
+        def select_relevant_contour(contours, danger_only=False):
+            candidates = []
+
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area <= 5:
+                    continue
+
+                x, y, w, h = cv2.boundingRect(contour)
+                center_x = x + (w // 2)
+                bottom_y = y + h
+                horizontal_distance = abs(center_x - frame_center)
+
+                # Red and yellow tokens outside the current driving
+                # corridor should not trigger unnecessary avoidance.
+                if danger_only and horizontal_distance > 75:
+                    continue
+
+                # Prefer nearby tokens, while still considering their
+                # visible size and horizontal relevance.
+                score = (
+                    bottom_y * 2.0
+                    + min(area, 120)
+                    - horizontal_distance * 0.35
+                )
+
+                candidates.append((score, contour))
+
+            if not candidates:
+                return None
+
+            return max(candidates, key=lambda item: item[0])[1]
+
         # Decision State Hierarchy [cite: 15]
         if evade_back_car:
             # Priority 1: Do not get wrecked from behind [cite: 31]
@@ -316,8 +352,11 @@ def processing_task():
             yellow_detected = False
             
             # Evade Red Tokens [cite: 20, 204]
-            if contours_red:
-                largest_red = max(contours_red, key=cv2.contourArea)
+            best_red = select_relevant_contour(contours_red, danger_only=True)
+
+            if best_red is not None:
+                largest_red = best_red
+
                 rx, ry, rw, rh = cv2.boundingRect(largest_red)
                 red_bottom = ry + rh
                 red_area = cv2.contourArea(largest_red)
@@ -341,8 +380,11 @@ def processing_task():
                     shared_data['red_detect_count'] = 0
 
             # Evade Yellow Corruption Fields [cite: 21, 205]
-            if not red_detected and contours_yellow:
-                largest_yellow = max(contours_yellow, key=cv2.contourArea)
+            best_yellow = select_relevant_contour(contours_yellow, danger_only=True)
+
+            if not red_detected and best_yellow is not None:
+                largest_yellow = best_yellow
+
                 yx, yy, yw, yh = cv2.boundingRect(largest_yellow)
                 yellow_bottom = yy + yh
                 yellow_area = cv2.contourArea(largest_yellow)
@@ -366,8 +408,11 @@ def processing_task():
                     shared_data['yellow_detect_count'] = 0
 
             # Collect Speed Upgrades [cite: 19, 204]
-            if not red_detected and not yellow_detected and contours_green:
-                largest_green = max(contours_green, key=cv2.contourArea)
+            best_green = select_relevant_contour(contours_green)
+
+            if not red_detected and not yellow_detected and best_green is not None:
+                largest_green = best_green
+                
                 gx, gy, gw, gh = cv2.boundingRect(largest_green)
                 green_bottom = gy + gh
                 if cv2.contourArea(largest_green) > 35 and green_bottom > 105:
