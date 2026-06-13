@@ -21,6 +21,7 @@ CONTROL_PORT = 8081
 shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
+    'debug_front_frame': None,  # Front frame with five-lane token labels
     'steering_input' : 0.0,
     'acceleration_input' : 1.0,
     'target_lane': 1,        # 0: Left, 1: Middle, 2: Right
@@ -35,6 +36,19 @@ shared_data = {
 }
 data_lock = threading.Lock()
 is_running = True
+
+# ---------------------------------------------------------
+# Debug Helper Configuration: five perspective-aware road lanes
+# These values match the trapezoid used by the existing road ROI.
+# The helper is visualization-only: it does not change steering decisions.
+# ---------------------------------------------------------
+NUM_LANES = 5
+ROAD_TOP_Y = 70
+ROAD_BOTTOM_Y = 239
+ROAD_LEFT_TOP = 115
+ROAD_RIGHT_TOP = 205
+ROAD_LEFT_BOTTOM = 40
+ROAD_RIGHT_BOTTOM = 280
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -207,6 +221,72 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+# ---------------------------------------------------------
+# Debug helpers: detect a token's perspective-correct lane and
+# build compact color observations for the front-camera overlay.
+# ---------------------------------------------------------
+def road_edges_at_y(pixel_y):
+    """Return the road's left and right edges at a vertical pixel position."""
+    pixel_y = float(np.clip(pixel_y, ROAD_TOP_Y, ROAD_BOTTOM_Y))
+    scale = (pixel_y - ROAD_TOP_Y) / float(ROAD_BOTTOM_Y - ROAD_TOP_Y)
+    left = ROAD_LEFT_TOP + (ROAD_LEFT_BOTTOM - ROAD_LEFT_TOP) * scale
+    right = ROAD_RIGHT_TOP + (ROAD_RIGHT_BOTTOM - ROAD_RIGHT_TOP) * scale
+    return left, right
+
+
+def pixel_x_to_debug_lane(pixel_x, pixel_y):
+    """Map a token center to L0..L4 while accounting for road perspective."""
+    left, right = road_edges_at_y(pixel_y)
+    road_width = right - left
+    if road_width <= 0:
+        return NUM_LANES // 2
+
+    relative_x = (float(pixel_x) - left) / road_width
+    lane = int(np.floor(relative_x * NUM_LANES))
+    return int(np.clip(lane, 0, NUM_LANES - 1))
+
+
+def debug_lane_divider_x(divider_index, pixel_y):
+    """Return the x-position of a white divider between two debug lanes."""
+    left, right = road_edges_at_y(pixel_y)
+    return int(left + (right - left) * divider_index / float(NUM_LANES))
+
+
+def collect_token_observations(contours, color_code, max_area=None, max_dimension=None):
+    """Convert contours into compact token records used only by the overlay."""
+    observations = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area <= 5:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if max_area is not None and area > max_area:
+            continue
+        if max_dimension is not None and max(w, h) > max_dimension:
+            continue
+
+        # Reject long fragments and sparse regions. Tokens should be compact.
+        aspect_ratio = w / float(max(h, 1))
+        fill_ratio = area / float(max(w * h, 1))
+        if aspect_ratio < 0.25 or aspect_ratio > 4.0 or fill_ratio < 0.18:
+            continue
+
+        center_x = x + w // 2
+        bottom_y = y + h
+        observations.append({
+            'color': color_code,
+            'x': x,
+            'y': y,
+            'w': w,
+            'h': h,
+            'lane': pixel_x_to_debug_lane(center_x, bottom_y),
+        })
+
+    return observations
+
+
 def processing_task():
     with data_lock:
         front_frame = shared_data['latest_front_frame']
@@ -271,6 +351,12 @@ def processing_task():
         upper_yellow = np.array([30, 255, 255])
         mask_yellow = cv2.inRange(hsv_frame, lower_yellow, upper_yellow)
 
+        # Grey helper mask: useful for visual checks after a yellow effect or
+        # during low brightness. Compact filtering below rejects large road areas.
+        lower_grey = np.array([0, 0, 80])
+        upper_grey = np.array([180, 48, 205])
+        mask_grey = cv2.inRange(hsv_frame, lower_grey, upper_grey)
+
         # Road Region of Interest (ROI): only detect tokens inside the visible road.
         # The polygon is tuned for the resized 320 x 240 front-camera frame.
         road_mask = np.zeros((240, 320), dtype=np.uint8)
@@ -286,10 +372,24 @@ def processing_task():
         mask_green = cv2.bitwise_and(mask_green, road_mask)
         mask_red = cv2.bitwise_and(mask_red, road_mask)
         mask_yellow = cv2.bitwise_and(mask_yellow, road_mask)
+        mask_grey = cv2.bitwise_and(mask_grey, road_mask)
         
         contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours_grey, _ = cv2.findContours(mask_grey, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # These observations are used only for the debug frame. Existing steering
+        # continues using the original green/red/yellow contour logic.
+        debug_greens = collect_token_observations(contours_green, 'G')
+        debug_reds = collect_token_observations(contours_red, 'R')
+        debug_yellows = collect_token_observations(contours_yellow, 'Y')
+        debug_greys = collect_token_observations(
+            contours_grey,
+            'X',
+            max_area=1500,
+            max_dimension=70,
+        )
 
         # Select the most relevant token instead of blindly choosing
         # the largest contour. Nearby tokens and tokens closer to the
@@ -449,6 +549,68 @@ def processing_task():
                 else:
                     shared_data['steering_input'] = 0.0
 
+        # ---------------------------------------------------------
+        # Front-camera debug frame: white five-lane guides plus token labels.
+        # G = green, R = red, Y = yellow, X = grey.
+        # This display does not alter the driving controller.
+        # ---------------------------------------------------------
+        debug_frame = small_frame.copy()
+
+        for divider_index in range(1, NUM_LANES):
+            top_x = debug_lane_divider_x(divider_index, ROAD_TOP_Y)
+            bottom_x = debug_lane_divider_x(divider_index, ROAD_BOTTOM_Y)
+            cv2.line(
+                debug_frame,
+                (top_x, ROAD_TOP_Y),
+                (bottom_x, ROAD_BOTTOM_Y),
+                (255, 255, 255),
+                1,
+            )
+
+        cv2.polylines(debug_frame, [road_polygon], True, (255, 255, 255), 1)
+
+        debug_colors = {
+            'G': (0, 255, 0),
+            'R': (0, 0, 255),
+            'Y': (0, 255, 255),
+            'X': (180, 180, 180),
+        }
+
+        for token in debug_greens + debug_reds + debug_yellows + debug_greys:
+            draw_color = debug_colors[token['color']]
+            cv2.rectangle(
+                debug_frame,
+                (token['x'], token['y']),
+                (token['x'] + token['w'], token['y'] + token['h']),
+                draw_color,
+                1,
+            )
+            cv2.putText(
+                debug_frame,
+                f"{token['color']} L{token['lane']}",
+                (token['x'], max(12, token['y'] - 3)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                draw_color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        cv2.putText(
+            debug_frame,
+            f"lanes={NUM_LANES} | G=green R=red Y=yellow X=grey",
+            (5, 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        with data_lock:
+            shared_data['debug_front_frame'] = debug_frame
+
+
 def send_controls_task():
     global control_conn
     if control_conn is None:
@@ -509,10 +671,12 @@ if __name__ == '__main__':
         while is_running:
             with data_lock:
                 front = shared_data.get('latest_front_frame')
+                debug_front = shared_data.get('debug_front_frame')
                 back = shared_data.get('latest_back_frame')
 
-            if front is not None:
-                cv2.imshow("Front Camera - AI Driving", cv2.resize(front, (640, 480)))
+            front_to_show = debug_front if debug_front is not None else front
+            if front_to_show is not None:
+                cv2.imshow("Front Camera - AI Driving", cv2.resize(front_to_show, (640, 480)))
             if back is not None:
                 cv2.imshow("Back Camera", cv2.resize(back, (640, 480)))
 
