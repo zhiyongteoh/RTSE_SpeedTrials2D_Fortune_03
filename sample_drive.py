@@ -27,6 +27,12 @@ shared_data = {
     'target_lane': 1,        # 0: Left, 1: Middle, 2: Right
     'current_lane': 1,
     'low_brightness': False,  # Event flag
+    # NEW: Darkness Improvement
+    'front_brightness': 255.0,
+    'darkness_enter_count': 0,
+    'darkness_exit_count': 0,
+    'lights_on': False,
+    'light_signal_timer': 0,
     'tap_timer': 0,
     'cooldown_timer': 0,
     'tap_steering': 0.0,
@@ -49,6 +55,58 @@ ROAD_LEFT_TOP = 115
 ROAD_RIGHT_TOP = 205
 ROAD_LEFT_BOTTOM = 40
 ROAD_RIGHT_BOTTOM = 280
+
+# Tighter token-detection ROI. This excludes the right road shoulder/curb and
+# the bottom player-car area while keeping the wider debug lane guides above.
+DETECT_ROAD_TOP_Y = 78
+DETECT_ROAD_BOTTOM_Y = 239
+DETECT_ROAD_LEFT_TOP = 120
+DETECT_ROAD_RIGHT_TOP = 200
+DETECT_ROAD_LEFT_BOTTOM = 52
+DETECT_ROAD_RIGHT_BOTTOM = 248
+EGO_IGNORE_LEFT = 102
+EGO_IGNORE_RIGHT = 218
+EGO_IGNORE_TOP = 185
+
+# Token-shape filters. They reject grass bands, lane markings, road shoulder
+# fragments, and the player's own car while still accepting round tokens.
+TOKEN_MIN_AREA = 8
+TOKEN_MAX_AREA = 5200
+TOKEN_MAX_DIMENSION = 96
+TOKEN_MIN_ASPECT = 0.35
+TOKEN_MAX_ASPECT = 2.6
+TOKEN_MIN_FILL_RATIO = 0.20
+RIGHT_SHOULDER_REJECT_MARGIN = 18
+
+# ---------------------------------------------------------
+# NEW: Darkness Improvement Configuration
+# ---------------------------------------------------------
+# Enter/exit Darkness Mode only after several frames so it does not flicker.
+DARKNESS_ENTER_THRESHOLD = 60.0
+DARKNESS_ENTER_FRAMES = 4
+DARKNESS_EXIT_THRESHOLD = 72.0
+DARKNESS_EXIT_FRAMES = 8
+
+# Extremely dark scene: avoid danger first, skip optional green chasing.
+CRITICAL_DARKNESS_THRESHOLD = 38.0
+
+# Slow down and reduce unnecessary steering during low visibility.
+DARKNESS_ACCELERATION = 0.76
+CRITICAL_DARKNESS_ACCELERATION = 0.62
+LIGHT_TOGGLE_ACCELERATION = -1.0
+LIGHT_TOGGLE_FRAMES = 6
+NORMAL_TAP_FRAMES = 12
+DARKNESS_TAP_FRAMES = 9
+NORMAL_COOLDOWN_FRAMES = 10
+DARKNESS_COOLDOWN_FRAMES = 12
+
+# Improve token detection in dark scenes.
+DARK_KERNEL = np.ones((3, 3), np.uint8)
+GAMMA_TABLE = np.array([
+    ((value / 255.0) ** 0.62) * 255
+    for value in range(256)
+]).astype('uint8')
+CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -252,25 +310,64 @@ def debug_lane_divider_x(divider_index, pixel_y):
     return int(left + (right - left) * divider_index / float(NUM_LANES))
 
 
+def detection_edges_at_y(pixel_y):
+    """Return the tighter token-detection area's left and right edges."""
+    pixel_y = float(np.clip(pixel_y, DETECT_ROAD_TOP_Y, DETECT_ROAD_BOTTOM_Y))
+    scale = (pixel_y - DETECT_ROAD_TOP_Y) / float(DETECT_ROAD_BOTTOM_Y - DETECT_ROAD_TOP_Y)
+    left = DETECT_ROAD_LEFT_TOP + (DETECT_ROAD_LEFT_BOTTOM - DETECT_ROAD_LEFT_TOP) * scale
+    right = DETECT_ROAD_RIGHT_TOP + (DETECT_ROAD_RIGHT_BOTTOM - DETECT_ROAD_RIGHT_TOP) * scale
+    return left, right
+
+
+def is_token_like_contour(contour, color_code=None):
+    """Reject road art, lane lines, grass bands, and the player's own car."""
+    area = cv2.contourArea(contour)
+    if area < TOKEN_MIN_AREA or area > TOKEN_MAX_AREA:
+        return False
+
+    x, y, w, h = cv2.boundingRect(contour)
+    if max(w, h) > TOKEN_MAX_DIMENSION:
+        return False
+
+    aspect_ratio = w / float(max(h, 1))
+    fill_ratio = area / float(max(w * h, 1))
+    if (
+        aspect_ratio < TOKEN_MIN_ASPECT
+        or aspect_ratio > TOKEN_MAX_ASPECT
+        or fill_ratio < TOKEN_MIN_FILL_RATIO
+    ):
+        return False
+
+    center_x = x + (w // 2)
+    bottom_y = y + h
+
+    if bottom_y >= EGO_IGNORE_TOP and EGO_IGNORE_LEFT <= center_x <= EGO_IGNORE_RIGHT:
+        return False
+
+    # The red-white right road shoulder often breaks into compact red blobs.
+    # Reject red detections hugging the detection boundary in the lower half.
+    if color_code == 'R':
+        _, right_edge = detection_edges_at_y(bottom_y)
+        if bottom_y > 120 and center_x > right_edge - RIGHT_SHOULDER_REJECT_MARGIN:
+            return False
+
+    return True
+
+
 def collect_token_observations(contours, color_code, max_area=None, max_dimension=None):
     """Convert contours into compact token records used only by the overlay."""
     observations = []
 
     for contour in contours:
-        area = cv2.contourArea(contour)
-        if area <= 5:
+        if not is_token_like_contour(contour, color_code):
             continue
+
+        area = cv2.contourArea(contour)
 
         x, y, w, h = cv2.boundingRect(contour)
         if max_area is not None and area > max_area:
             continue
         if max_dimension is not None and max(w, h) > max_dimension:
-            continue
-
-        # Reject long fragments and sparse regions. Tokens should be compact.
-        aspect_ratio = w / float(max(h, 1))
-        fill_ratio = area / float(max(w * h, 1))
-        if aspect_ratio < 0.25 or aspect_ratio > 4.0 or fill_ratio < 0.18:
             continue
 
         center_x = x + w // 2
@@ -285,6 +382,73 @@ def collect_token_observations(contours, color_code, max_area=None, max_dimensio
         })
 
     return observations
+
+
+# ---------------------------------------------------------
+# NEW: Darkness Improvement Helper Functions
+# ---------------------------------------------------------
+def set_vehicle_light(is_on, brightness):
+    """
+    Track the vehicle light state when Darkness Mode changes and schedule the
+    Unity-recognized light command. The game logs show that acceleration -1.0
+    during darkness restores the lights.
+    """
+    if shared_data['lights_on'] == is_on:
+        return
+
+    shared_data['lights_on'] = is_on
+    if is_on:
+        shared_data['light_signal_timer'] = LIGHT_TOGGLE_FRAMES
+    light_state = "ON" if is_on else "OFF"
+    print(f"Vehicle Light {light_state} | brightness={brightness:.1f}")
+
+
+def update_darkness_state(brightness):
+    """
+    Prevent Darkness Mode from switching on/off because of one unusual frame.
+    """
+    with data_lock:
+        shared_data['front_brightness'] = float(brightness)
+
+        if not shared_data['low_brightness']:
+            shared_data['darkness_exit_count'] = 0
+            if brightness < DARKNESS_ENTER_THRESHOLD:
+                shared_data['darkness_enter_count'] += 1
+            else:
+                shared_data['darkness_enter_count'] = 0
+
+            if shared_data['darkness_enter_count'] >= DARKNESS_ENTER_FRAMES:
+                shared_data['low_brightness'] = True
+                shared_data['darkness_enter_count'] = 0
+                set_vehicle_light(True, brightness)
+                print(f"Darkness Mode ON | brightness={brightness:.1f}")
+        else:
+            shared_data['darkness_enter_count'] = 0
+            if brightness > DARKNESS_EXIT_THRESHOLD:
+                shared_data['darkness_exit_count'] += 1
+            else:
+                shared_data['darkness_exit_count'] = 0
+
+            if shared_data['darkness_exit_count'] >= DARKNESS_EXIT_FRAMES:
+                shared_data['low_brightness'] = False
+                shared_data['darkness_exit_count'] = 0
+                set_vehicle_light(False, brightness)
+                print(f"Darkness Mode OFF | brightness={brightness:.1f}")
+
+        return shared_data['low_brightness']
+
+
+def enhance_low_light_frame(frame):
+    """
+    Brighten the camera frame before token detection.
+    Gamma correction brightens dark pixels; CLAHE improves local contrast.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    value = cv2.LUT(value, GAMMA_TABLE)
+    value = CLAHE.apply(value)
+    enhanced_hsv = cv2.merge((hue, saturation, value))
+    return cv2.cvtColor(enhanced_hsv, cv2.COLOR_HSV2BGR)
 
 
 def processing_task():
@@ -324,31 +488,49 @@ def processing_task():
     if front_frame is not None:
         small_frame = cv2.resize(front_frame, (320, 240))
         
-        # Dynamic Environmental Check: Low Brightness Mitigation [cite: 36, 214]
+        # ---------------------------------------------------------
+        # NEW: Darkness Improvement
+        # ---------------------------------------------------------
         gray_front = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-        brightness = np.mean(gray_front)
-        with data_lock:
-            if brightness < 60:  # Threshold identifying light corruption [cite: 35]
-                shared_data['low_brightness'] = True  # Activates toggle switch flag [cite: 36, 214]
-            else:
-                shared_data['low_brightness'] = False
+        brightness = float(np.mean(gray_front))
+        low_brightness = update_darkness_state(brightness)
+        critical_darkness = (
+            low_brightness and brightness < CRITICAL_DARKNESS_THRESHOLD
+        )
 
-        hsv_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2HSV)
+        if low_brightness:
+            analysis_frame = enhance_low_light_frame(small_frame)
+        else:
+            analysis_frame = small_frame
+
+        hsv_frame = cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2HSV)
         
         # Extended Range Color Masks [cite: 140, 141]
-        lower_green = np.array([35, 40, 40]) 
-        upper_green = np.array([85, 255, 255])
+        # NEW: Darkness Improvement - widen HSV ranges only in dark scenes.
+        if low_brightness:
+            lower_green = np.array([32, 28, 28])
+            upper_green = np.array([92, 255, 255])
+            lower_red1 = np.array([0, 35, 28])
+            upper_red1 = np.array([13, 255, 255])
+            lower_red2 = np.array([167, 35, 28])
+            upper_red2 = np.array([180, 255, 255])
+            lower_yellow = np.array([12, 35, 30])
+            upper_yellow = np.array([35, 255, 255])
+        else:
+            lower_green = np.array([35, 40, 40])
+            upper_green = np.array([85, 255, 255])
+            lower_red1 = np.array([0, 50, 50])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([170, 50, 50])
+            upper_red2 = np.array([180, 255, 255])
+            lower_yellow = np.array([15, 50, 50])
+            upper_yellow = np.array([30, 255, 255])
+
         mask_green = cv2.inRange(hsv_frame, lower_green, upper_green)
         
-        lower_red1 = np.array([0, 50, 50])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 50, 50])
-        upper_red2 = np.array([180, 255, 255])
         mask_red = cv2.bitwise_or(cv2.inRange(hsv_frame, lower_red1, upper_red1), 
                                   cv2.inRange(hsv_frame, lower_red2, upper_red2))
                                   
-        lower_yellow = np.array([15, 50, 50])
-        upper_yellow = np.array([30, 255, 255])
         mask_yellow = cv2.inRange(hsv_frame, lower_yellow, upper_yellow)
 
         # Grey helper mask: useful for visual checks after a yellow effect or
@@ -361,18 +543,27 @@ def processing_task():
         # The polygon is tuned for the resized 320 x 240 front-camera frame.
         road_mask = np.zeros((240, 320), dtype=np.uint8)
         road_polygon = np.array([
-            [40, 239],
-            [280, 239],
-            [205, 70],
-            [115, 70]
+            [DETECT_ROAD_LEFT_BOTTOM, DETECT_ROAD_BOTTOM_Y],
+            [DETECT_ROAD_RIGHT_BOTTOM, DETECT_ROAD_BOTTOM_Y],
+            [DETECT_ROAD_RIGHT_TOP, DETECT_ROAD_TOP_Y],
+            [DETECT_ROAD_LEFT_TOP, DETECT_ROAD_TOP_Y]
         ], dtype=np.int32)
         cv2.fillPoly(road_mask, [road_polygon], 255)
+
+        # Ignore the player's own red car/hood at the bottom of the camera.
+        road_mask[EGO_IGNORE_TOP:240, EGO_IGNORE_LEFT:EGO_IGNORE_RIGHT] = 0
 
         # Apply the road ROI before contour detection so off-road colors are ignored.
         mask_green = cv2.bitwise_and(mask_green, road_mask)
         mask_red = cv2.bitwise_and(mask_red, road_mask)
         mask_yellow = cv2.bitwise_and(mask_yellow, road_mask)
         mask_grey = cv2.bitwise_and(mask_grey, road_mask)
+
+        # NEW: Darkness Improvement - reconnect small broken token regions.
+        if low_brightness:
+            mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, DARK_KERNEL)
+            mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, DARK_KERNEL)
+            mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, DARK_KERNEL)
         
         contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -390,17 +581,22 @@ def processing_task():
             max_area=1500,
             max_dimension=70,
         )
+        filtered_red_contours = [
+            contour for contour in contours_red
+            if is_token_like_contour(contour, 'R')
+        ]
 
         # Select the most relevant token instead of blindly choosing
         # the largest contour. Nearby tokens and tokens closer to the
         # vehicle's driving path receive a higher score.
-        def select_relevant_contour(contours, danger_only=False):
+        def select_relevant_contour(contours, danger_only=False, color_code=None):
             candidates = []
 
             for contour in contours:
-                area = cv2.contourArea(contour)
-                if area <= 5:
+                if not is_token_like_contour(contour, color_code):
                     continue
+
+                area = cv2.contourArea(contour)
 
                 x, y, w, h = cv2.boundingRect(contour)
                 center_x = x + (w // 2)
@@ -433,9 +629,9 @@ def processing_task():
             steering_target = back_steering_escape
             print(f"Trailing Car Alert! Escaping to steering: {steering_target}")
             
-        elif police_mode and contours_red:
+        elif police_mode and filtered_red_contours:
             # Priority 2: Catch red token intentionally if Police are chasing [cite: 33, 213]
-            largest_red = max(contours_red, key=cv2.contourArea)
+            largest_red = max(filtered_red_contours, key=cv2.contourArea)
             if cv2.contourArea(largest_red) > 5:
                 M = cv2.moments(largest_red)
                 if M['m00'] > 0:
@@ -452,7 +648,7 @@ def processing_task():
             yellow_detected = False
             
             # Evade Red Tokens [cite: 20, 204]
-            best_red = select_relevant_contour(contours_red, danger_only=True)
+            best_red = select_relevant_contour(contours_red, danger_only=True, color_code='R')
 
             if best_red is not None:
                 largest_red = best_red
@@ -480,7 +676,7 @@ def processing_task():
                     shared_data['red_detect_count'] = 0
 
             # Evade Yellow Corruption Fields [cite: 21, 205]
-            best_yellow = select_relevant_contour(contours_yellow, danger_only=True)
+            best_yellow = select_relevant_contour(contours_yellow, danger_only=True, color_code='Y')
 
             if not red_detected and best_yellow is not None:
                 largest_yellow = best_yellow
@@ -508,14 +704,23 @@ def processing_task():
                     shared_data['yellow_detect_count'] = 0
 
             # Collect Speed Upgrades [cite: 19, 204]
-            best_green = select_relevant_contour(contours_green)
+            best_green = select_relevant_contour(contours_green, color_code='G')
 
-            if not red_detected and not yellow_detected and best_green is not None:
+            # NEW: Darkness Improvement
+            # During critical darkness, avoid danger first and skip optional green tokens.
+            if not red_detected and not yellow_detected and not critical_darkness and best_green is not None:
                 largest_green = best_green
                 
                 gx, gy, gw, gh = cv2.boundingRect(largest_green)
                 green_bottom = gy + gh
-                if cv2.contourArea(largest_green) > 35 and green_bottom > 105:
+                if low_brightness:
+                    minimum_green_area = 48
+                    minimum_green_bottom = 125
+                else:
+                    minimum_green_area = 35
+                    minimum_green_bottom = 105
+
+                if cv2.contourArea(largest_green) > minimum_green_area and green_bottom > minimum_green_bottom:
                     M = cv2.moments(largest_green)
                     if M['m00'] > 0:
                         gx = int(M['m10'] / M['m00'])
@@ -533,7 +738,12 @@ def processing_task():
                 shared_data['tap_timer'] -= 1
                 shared_data['steering_input'] = shared_data['tap_steering']
                 if shared_data['tap_timer'] == 0:
-                    shared_data['cooldown_timer'] = 10 # State 2: Enforce 0.0 wait after tap [cite: 157, 158]
+                    # NEW: Darkness Improvement
+                    # Wait slightly longer during darkness to reduce random left-right movement.
+                    if shared_data['low_brightness']:
+                        shared_data['cooldown_timer'] = DARKNESS_COOLDOWN_FRAMES
+                    else:
+                        shared_data['cooldown_timer'] = NORMAL_COOLDOWN_FRAMES
                     shared_data['steering_input'] = 0.0
             elif shared_data['cooldown_timer'] > 0:
                 # State 2: Waiting for car to settle [cite: 157]
@@ -543,7 +753,11 @@ def processing_task():
                 # State 0: Ready for a new tap [cite: 154]
                 if steering_target != 0.0:
                     shared_data['tap_steering'] = steering_target
-                    shared_data['tap_timer'] = 12  # Discrete tap sequence execution frames
+                    # NEW: Darkness Improvement - use shorter steering taps in darkness.
+                    if shared_data['low_brightness']:
+                        shared_data['tap_timer'] = DARKNESS_TAP_FRAMES
+                    else:
+                        shared_data['tap_timer'] = NORMAL_TAP_FRAMES
                     shared_data['steering_input'] = steering_target
                     print(f"Initiating Tap! Steering: {steering_target}")
                 else:
@@ -554,7 +768,8 @@ def processing_task():
         # G = green, R = red, Y = yellow, X = grey.
         # This display does not alter the driving controller.
         # ---------------------------------------------------------
-        debug_frame = small_frame.copy()
+        # NEW: Darkness Improvement - display enhanced frame during Darkness Mode.
+        debug_frame = analysis_frame.copy()
 
         for divider_index in range(1, NUM_LANES):
             top_x = debug_lane_divider_x(divider_index, ROAD_TOP_Y)
@@ -598,8 +813,23 @@ def processing_task():
 
         cv2.putText(
             debug_frame,
-            f"lanes={NUM_LANES} | G=green R=red Y=yellow X=grey",
+            (
+                f"mode={'DARKNESS' if low_brightness else 'NORMAL'} | "
+                f"light={'SIGNAL' if shared_data['light_signal_timer'] > 0 else ('ON' if shared_data['lights_on'] else 'OFF')} | "
+                f"brightness={brightness:.1f}"
+            ),
             (5, 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            debug_frame,
+            f"lanes={NUM_LANES} | G=green R=red Y=yellow X=grey",
+            (5, 31),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.38,
             (255, 255, 255),
@@ -623,10 +853,17 @@ def send_controls_task():
     
     with data_lock:
         steering_to_send = shared_data['steering_input']
-        # Handle Low Brightness: Map structural change to reverse acceleration or signal value tweaks if required [cite: 36, 164]
-        if shared_data['low_brightness']:
-            # Modulate throttle or activate lighting sequences over standard float packing [cite: 162]
-            acceleration_to_send = 0.95  
+        # NEW: Darkness Improvement
+        # Unity treats acceleration -1.0 during darkness as the light recovery command.
+        if shared_data['light_signal_timer'] > 0:
+            shared_data['light_signal_timer'] -= 1
+            steering_to_send = 0.0
+            acceleration_to_send = LIGHT_TOGGLE_ACCELERATION
+        elif shared_data['low_brightness']:
+            if shared_data['front_brightness'] < CRITICAL_DARKNESS_THRESHOLD:
+                acceleration_to_send = CRITICAL_DARKNESS_ACCELERATION
+            else:
+                acceleration_to_send = DARKNESS_ACCELERATION
         else:
             acceleration_to_send = 1.0 # Default: full gas ahead [cite: 174]
 
