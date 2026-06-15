@@ -78,6 +78,10 @@ EGO_IGNORE_LEFT = 102
 EGO_IGNORE_RIGHT = 218
 EGO_IGNORE_TOP = 185
 
+PROXIMITY_SCAN_TOP = 165
+PROXIMITY_SCAN_BOTTOM = 185
+PROXIMITY_PIXEL_THRESHOLD = 15
+
 # Token-shape filters. They reject grass bands, lane markings, road shoulder
 # fragments, and the player's own car while still accepting round tokens.
 TOKEN_MIN_AREA = 8
@@ -946,26 +950,66 @@ def processing_task():
             mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, DARK_KERNEL)
             mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, DARK_KERNEL)
         
-        contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours_grey, _ = cv2.findContours(mask_grey, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # These observations are used only for the debug frame. Existing steering
-        # continues using the original green/red/yellow contour logic.
-        debug_greens = collect_token_observations(contours_green, 'G')
-        debug_reds = collect_token_observations(contours_red, 'R')
-        debug_yellows = collect_token_observations(contours_yellow, 'Y')
-        debug_greys = collect_token_observations(
-            contours_grey,
-            'X',
-            max_area=1500,
-            max_dimension=70,
-        )
         filtered_red_contours = [
             contour for contour in contours_red
             if is_token_like_contour(contour, 'R')
         ]
+
+        # ---------------------------------------------------------
+        # FIXED: Proximity Scan Line - 5 Bucket Bounding Boxes
+        # ---------------------------------------------------------
+        scan_y_center = (PROXIMITY_SCAN_TOP + PROXIMITY_SCAN_BOTTOM) // 2
+        left_edge, right_edge = road_edges_at_y(scan_y_center)
+        
+        # Pull inward slightly to avoid picking up outer grass borders/sidewalk fragments
+        buffer_margin = 8  
+        left_edge += buffer_margin
+        right_edge -= buffer_margin
+        
+        lane_width = (right_edge - left_edge) / float(NUM_LANES)
+        
+        scan_boxes = []
+        lane_states = ['Clear'] * NUM_LANES
+        
+        for i in range(NUM_LANES):
+            x1 = int(left_edge + i * lane_width)
+            x2 = int(left_edge + (i + 1) * lane_width)
+            scan_boxes.append((x1, PROXIMITY_SCAN_TOP, x2, PROXIMITY_SCAN_BOTTOM))
+            
+            red_roi = mask_red[PROXIMITY_SCAN_TOP:PROXIMITY_SCAN_BOTTOM, x1:x2]
+            yellow_roi = mask_yellow[PROXIMITY_SCAN_TOP:PROXIMITY_SCAN_BOTTOM, x1:x2]
+            green_roi = mask_green[PROXIMITY_SCAN_TOP:PROXIMITY_SCAN_BOTTOM, x1:x2]
+            
+            # --- Anti-Grass Noise Validation ---
+            # Instead of a blind pixel count, check if the matching pixels form a structural object 
+            # rather than a thin, scattered edge slice or large ground mass.
+            valid_green = False
+            if cv2.countNonZero(green_roi) > PROXIMITY_PIXEL_THRESHOLD:
+                # Find local contours within this lane segment slice to verify shape integrity
+                sub_contours, _ = cv2.findContours(green_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for sc in sub_contours:
+                    sc_area = cv2.contourArea(sc)
+                    # Legitimate tokens at this perspective scale have structured footprint areas
+                    if 6 <= sc_area <= 450:
+                        valid_green = True
+                        break
+
+            valid_danger = False
+            if cv2.countNonZero(red_roi) > PROXIMITY_PIXEL_THRESHOLD or cv2.countNonZero(yellow_roi) > PROXIMITY_PIXEL_THRESHOLD:
+                # Validate Danger tokens similarly to ensure it's not the curb track border line splitting
+                combined_danger_mask = cv2.bitwise_or(red_roi, yellow_roi)
+                sub_contours_d, _ = cv2.findContours(combined_danger_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for sc in sub_contours_d:
+                    if 6 <= cv2.contourArea(sc) <= 450:
+                        valid_danger = True
+                        break
+            
+            # Assign states based on filtered structural results
+            if valid_danger:
+                lane_states[i] = 'Danger'
+            elif not critical_darkness and valid_green:
+                lane_states[i] = 'Target'
         police_candidate_box = police_debug.get('candidate_box')
         police_raw_box = police_debug.get('raw_candidate_box')
         police_detected_now = False
@@ -1055,51 +1099,11 @@ def processing_task():
                 police_sudden_risk = True
                 police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
 
-        # Select the most relevant token instead of blindly choosing
-        # the largest contour. Nearby tokens and tokens closer to the
-        # vehicle's driving path receive a higher score.
-        def select_relevant_contour(contours, danger_only=False, color_code=None):
-            candidates = []
-
-            for contour in contours:
-                if not is_token_like_contour(contour, color_code):
-                    continue
-
-                area = cv2.contourArea(contour)
-
-                x, y, w, h = cv2.boundingRect(contour)
-                center_x = x + (w // 2)
-                bottom_y = y + h
-                horizontal_distance = abs(center_x - frame_center)
-
-                # Red and yellow tokens outside the current driving
-                # corridor should not trigger unnecessary avoidance.
-                if danger_only and horizontal_distance > 75:
-                    continue
-
-                # Prefer nearby tokens, while still considering their
-                # visible size and horizontal relevance.
-                score = (
-                    bottom_y * 2.0
-                    + min(area, 120)
-                    - horizontal_distance * 0.35
-                )
-
-                candidates.append((score, contour))
-
-            if not candidates:
-                return None
-
-            return max(candidates, key=lambda item: item[0])[1]
-
         police_urgent_avoidance = False
 
         # Decision State Hierarchy [cite: 15]
-        if evade_back_car:
-            # Priority 1: Do not get wrecked from behind [cite: 31]
-            steering_target = back_steering_escape
-            print(f"Trailing Car Alert! Escaping to steering: {steering_target}")
-        elif police_collision_imminent:
+        if police_collision_imminent:
+            # Priority 1: Do not hit the police car head-on
             steering_target = police_escape_steering
             police_urgent_avoidance = True
             with data_lock:
@@ -1159,93 +1163,40 @@ def processing_task():
                             )
 
         else:
-            # Priority 3: Standard Navigation (Seek Green [cite: 19, 204], Dodge Red [cite: 20, 204], Dodge Yellow [cite: 21, 205])
-            red_detected = False
-            yellow_detected = False
+            # Priority 3: Standard Navigation using the 5-Bucket Logic Engine
+            ego_lane = 2  # The camera is fixed to the car, so the car is always in lane 2
+            current_state = lane_states[ego_lane]
+            best_lane = ego_lane
             
-            # Evade Red Tokens [cite: 20, 204]
-            best_red = select_relevant_contour(contours_red, danger_only=True, color_code='R')
-
-            if best_red is not None:
-                largest_red = best_red
-
-                rx, ry, rw, rh = cv2.boundingRect(largest_red)
-                red_bottom = ry + rh
-                red_area = cv2.contourArea(largest_red)
-
-                if red_area > 5 and red_bottom > 60:
-                    with data_lock:
-                        shared_data['red_detect_count'] += 1
-
-                    if shared_data['red_detect_count'] >= 2:
-                        M = cv2.moments(largest_red)
-                        if M['m00'] > 0:
-                            rx = int(M['m10'] / M['m00'])
-                            steering_target = -1.0 if rx > frame_center else 1.0
-                            red_detected = True
-                            print("Evading Red Token Early!")
-                else:
-                    with data_lock:
-                        shared_data['red_detect_count'] = 0
-            else:
-                with data_lock:
-                    shared_data['red_detect_count'] = 0
-
-            # Evade Yellow Corruption Fields [cite: 21, 205]
-            best_yellow = select_relevant_contour(contours_yellow, danger_only=True, color_code='Y')
-
-            if not red_detected and best_yellow is not None:
-                largest_yellow = best_yellow
-
-                yx, yy, yw, yh = cv2.boundingRect(largest_yellow)
-                yellow_bottom = yy + yh
-                yellow_area = cv2.contourArea(largest_yellow)
-
-                if yellow_area > 5 and yellow_bottom > 60:
-                    with data_lock:
-                        shared_data['yellow_detect_count'] += 1
-
-                    if shared_data['yellow_detect_count'] >= 2:
-                        M = cv2.moments(largest_yellow)
-                        if M['m00'] > 0:
-                            yx = int(M['m10'] / M['m00'])
-                            steering_target = -1.0 if yx > frame_center else 1.0
-                            yellow_detected = True
-                            print("Evading Corruptive Yellow Token Early!")
-                else:
-                    with data_lock:
-                        shared_data['yellow_detect_count'] = 0
-            else:
-                with data_lock:
-                    shared_data['yellow_detect_count'] = 0
-
-            # Collect Speed Upgrades [cite: 19, 204]
-            best_green = select_relevant_contour(contours_green, color_code='G')
-
-            # NEW: Darkness Improvement
-            # During critical darkness, avoid danger first and skip optional green tokens.
-            if not red_detected and not yellow_detected and not critical_darkness and best_green is not None:
-                largest_green = best_green
-                
-                gx, gy, gw, gh = cv2.boundingRect(largest_green)
-                green_bottom = gy + gh
-                if low_brightness:
-                    minimum_green_area = 48
-                    minimum_green_bottom = 125
-                else:
-                    minimum_green_area = 35
-                    minimum_green_bottom = 105
-
-                if cv2.contourArea(largest_green) > minimum_green_area and green_bottom > minimum_green_bottom:
-                    M = cv2.moments(largest_green)
-                    if M['m00'] > 0:
-                        gx = int(M['m10'] / M['m00'])
-                        error = gx - frame_center
-                        if error < -35:
-                            steering_target = -1.0
-                        elif error > 35:
-                            steering_target = 1.0
-                        print(f"Targeting Green Token! Error: {error}") 
+            if current_state == 'Danger':
+                # Need to escape. Find nearest Target or Clear lane
+                min_dist = float('inf')
+                for priority in ['Target', 'Clear']:
+                    for i, state in enumerate(lane_states):
+                        if state == priority:
+                            dist = abs(i - ego_lane)
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_lane = i
+                    if best_lane != ego_lane:
+                        break
+            elif current_state == 'Clear':
+                # Safe, but look for a Target (Green) lane
+                min_dist = float('inf')
+                for i, state in enumerate(lane_states):
+                    if state == 'Target':
+                        dist = abs(i - ego_lane)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_lane = i
+                            
+            # Fire Steering Commands
+            if best_lane < ego_lane:
+                steering_target = -1.0
+                print(f"Logic Engine: Steering LEFT to Lane {best_lane}")
+            elif best_lane > ego_lane:
+                steering_target = 1.0
+                print(f"Logic Engine: Steering RIGHT to Lane {best_lane}")
 
         # Commit decision to shared resources safely using a Tap Sequence [cite: 152]
         with data_lock:
@@ -1326,29 +1277,61 @@ def processing_task():
 
         cv2.polylines(debug_frame, [road_polygon], True, (255, 255, 255), 1)
 
-        debug_colors = {
-            'G': (0, 255, 0),
-            'R': (0, 0, 255),
-            'Y': (0, 255, 255),
-            'X': (180, 180, 180),
-        }
-
-        for token in debug_greens + debug_reds + debug_yellows + debug_greys:
-            draw_color = debug_colors[token['color']]
-            cv2.rectangle(
-                debug_frame,
-                (token['x'], token['y']),
-                (token['x'] + token['w'], token['y'] + token['h']),
-                draw_color,
-                1,
-            )
+        # Draw the 5-Bucket Proximity Scan Line
+        # ---------------------------------------------------------
+        # FIXED: Perspective-Aware 5-Bucket Mesh Overlay
+        # ---------------------------------------------------------
+        # Calculate boundaries at both the top and bottom of the scan zone
+        top_left_edge, top_right_edge = road_edges_at_y(PROXIMITY_SCAN_TOP)
+        bottom_left_edge, bottom_right_edge = road_edges_at_y(PROXIMITY_SCAN_BOTTOM)
+        
+        # Apply the exact same buffer margin used in your processing logic
+        buffer_margin = 8
+        top_left_edge += buffer_margin
+        top_right_edge -= buffer_margin
+        bottom_left_edge += buffer_margin
+        bottom_right_edge -= buffer_margin
+        
+        # Determine the sliding width per lane step for top and bottom lines
+        top_lane_width = (top_right_edge - top_left_edge) / float(NUM_LANES)
+        bottom_lane_width = (bottom_right_edge - bottom_left_edge) / float(NUM_LANES)
+        
+        for i in range(NUM_LANES):
+            state = lane_states[i]
+            if state == 'Danger':
+                color = (0, 0, 255)      # Red
+            elif state == 'Target':
+                color = (0, 255, 0)      # Green
+            else:
+                color = (255, 255, 255)  # White
+                
+            # Calculate the 4 corner points of the perspective polygon for lane i
+            tx1 = int(top_left_edge + i * top_lane_width)
+            tx2 = int(top_left_edge + (i + 1) * top_lane_width)
+            bx1 = int(bottom_left_edge + i * bottom_lane_width)
+            bx2 = int(bottom_left_edge + (i + 1) * bottom_lane_width)
+            
+            # Construct the polygon vertex array
+            pts = np.array([
+                [tx1, PROXIMITY_SCAN_TOP],      # Top-Left
+                [tx2, PROXIMITY_SCAN_TOP],      # Top-Right
+                [bx2, PROXIMITY_SCAN_BOTTOM],   # Bottom-Right
+                [bx1, PROXIMITY_SCAN_BOTTOM]    # Bottom-Left
+            ], dtype=np.int32)
+            
+            # Draw the perspective quad frame
+            cv2.polylines(debug_frame, [pts], True, color, 1, lineType=cv2.LINE_AA)
+            
+            # Position the text dynamically near the lower center of each custom quad
+            text_x = int((bx1 + bx2) / 2) - 12
+            text_y = PROXIMITY_SCAN_BOTTOM - 4
             cv2.putText(
                 debug_frame,
-                f"{token['color']} L{token['lane']}",
-                (token['x'], max(12, token['y'] - 3)),
+                f"L{i}:{state[0]}",
+                (text_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                draw_color,
+                0.32,
+                color,
                 1,
                 cv2.LINE_AA,
             )
@@ -1370,7 +1353,7 @@ def processing_task():
 
         cv2.putText(
             debug_frame,
-            f"lanes={NUM_LANES} | G=green R=red Y=yellow X=grey",
+            f"lanes={NUM_LANES} | Scan Line Active",
             (5, 31),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.38,
@@ -1541,3 +1524,5 @@ if __name__ == '__main__':
         control_conn.close()
     cv2.destroyAllWindows()
     print("System terminated cleanly.")
+
+
