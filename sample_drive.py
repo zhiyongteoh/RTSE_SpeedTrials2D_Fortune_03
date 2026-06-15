@@ -48,7 +48,11 @@ shared_data = {
     'police_avoid_steering': 0.0,
     'police_avoid_acceleration': 0.25,
     'red_detect_count': 0,
-    'yellow_detect_count': 0
+    'yellow_detect_count': 0,
+    'trailing_detect_count': 0,
+    'trailing_escape_cooldown': 0,
+    'trailing_escape_send_timer': 0,
+    'trailing_debug_tick': 0
 }
 data_lock = threading.Lock()
 is_running = True
@@ -173,8 +177,12 @@ LIGHT_TOGGLE_ACCELERATION = -1.0
 LIGHT_TOGGLE_FRAMES = 6
 NORMAL_TAP_FRAMES = 14          # Increased: Stronger steering duration
 DARKNESS_TAP_FRAMES = 11        # Increased: Longer dodge in darkness
+TRAILING_TAP_FRAMES = 24
+TRAILING_CONFIRM_FRAMES = 1
+TRAILING_ESCAPE_COOLDOWN_FRAMES = 45
 NORMAL_COOLDOWN_FRAMES = 8      # Reduced: Faster recovery for repeated dodges
 DARKNESS_COOLDOWN_FRAMES = 12
+TRAILING_DEBUG_VERSION = "trailing-v5-state"
 
 # Improve token detection in dark scenes.
 DARK_KERNEL = np.ones((3, 3), np.uint8)
@@ -527,6 +535,68 @@ def enhance_low_light_frame(frame):
     return cv2.cvtColor(enhanced_hsv, cv2.COLOR_HSV2BGR)
 
 
+def evaluate_trailing_signal(
+    avg_intensity,
+    contrast,
+    edge_density,
+    lower_edge_density,
+    upper_edge_density,
+    largest_edge_blob,
+    lowest_blob_bottom,
+):
+    """Return (signal, reason) for rear-car danger from compact ROI metrics."""
+    triggers = {
+        'NORMAL': (
+            contrast > 34
+            and lower_edge_density > 0.070
+            and lower_edge_density > upper_edge_density * 1.10
+            and largest_edge_blob > 1400
+            and lowest_blob_bottom > 92
+        ),
+        'HUGE_APPROACH': (
+            largest_edge_blob > 8000
+            and lowest_blob_bottom > 85
+            and edge_density > 0.040
+        ),
+        'DIM_CLOSE': (
+            avg_intensity < 35
+            and contrast > 28
+            and largest_edge_blob > 4200
+            and lowest_blob_bottom > 100
+        ),
+        'WEAK_CLOSE': (
+            contrast > 38
+            and edge_density > 0.018
+            and largest_edge_blob > 900
+            and lowest_blob_bottom > 112
+        ),
+        'VERY_DARK': (
+            avg_intensity < 14
+            and largest_edge_blob > 650
+            and lowest_blob_bottom > 96
+        ),
+        'APPROACH': (
+            contrast > 32
+            and edge_density > 0.035
+            and largest_edge_blob > 5000
+            and 78 < lowest_blob_bottom <= 112
+        ),
+    }
+
+    for reason, is_triggered in triggers.items():
+        if is_triggered:
+            return True, reason
+
+    return False, 'NONE'
+
+
+def choose_trailing_escape_direction(current_lane):
+    """Choose one lane-change direction for a confirmed rear-car event."""
+    if current_lane >= 2:
+        return -1.0
+    return 1.0
+
+
 def detect_front_police_car(base_frame, road_mask):
     """
     Detect the front police car as one large object that contains both
@@ -849,12 +919,88 @@ def processing_task():
         back_roi = gray_back[120:240, 60:260]
         avg_intensity = np.mean(back_roi)
         contrast = np.std(back_roi)
-        
+
         # Brightness alone was too sensitive, so require stronger brightness + contrast.
         if (avg_intensity > 225 or avg_intensity < 25) and contrast > 18:
+        
+            blurred_back_roi = cv2.GaussianBlur(back_roi, (5, 5), 0)
+            rear_edges = cv2.Canny(blurred_back_roi, 45, 135)
+            edge_density = cv2.countNonZero(rear_edges) / float(back_roi.size)
+            lower_edges = rear_edges[60:120, :]
+            upper_edges = rear_edges[0:60, :]
+            lower_edge_density = cv2.countNonZero(lower_edges) / float(lower_edges.size)
+            upper_edge_density = cv2.countNonZero(upper_edges) / float(upper_edges.size)
+
+            edge_kernel = np.ones((5, 5), np.uint8)
+            connected_edges = cv2.dilate(rear_edges, edge_kernel, iterations=2)
+            contours, _ = cv2.findContours(
+                connected_edges,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        largest_edge_blob = 0
+        lowest_blob_bottom = 0
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = cv2.contourArea(contour)
+            aspect_ratio = w / float(max(h, 1))
+            if 0.45 <= aspect_ratio <= 4.5 and area > largest_edge_blob:
+                largest_edge_blob = area
+                lowest_blob_bottom = y + h
+
+        rear_car_signal, rear_signal_reason = evaluate_trailing_signal(
+            avg_intensity,
+            contrast,
+            edge_density,
+            lower_edge_density,
+            upper_edge_density,
+            largest_edge_blob,
+            lowest_blob_bottom,
+        )
+
+        with data_lock:
+            if shared_data['trailing_escape_cooldown'] > 0:
+                shared_data['trailing_escape_cooldown'] -= 1
+
+            if rear_car_signal:
+                shared_data['trailing_detect_count'] += 1
+            else:
+                shared_data['trailing_detect_count'] = 0
+
+            shared_data['trailing_debug_tick'] = (shared_data['trailing_debug_tick'] + 1) % 30
+            should_print_watch = shared_data['trailing_debug_tick'] == 0
+            confirmed_rear_car = (
+                shared_data['trailing_detect_count'] >= TRAILING_CONFIRM_FRAMES
+                and shared_data['trailing_escape_cooldown'] == 0
+            )
+
+        if should_print_watch:
+            print(
+                "Trailing Watch: "
+                f"{TRAILING_DEBUG_VERSION} "
+                f"avg={avg_intensity:.1f}, contrast={contrast:.1f}, "
+                f"edges={edge_density:.3f}, lower={lower_edge_density:.3f}, "
+                f"blob={largest_edge_blob:.0f}, bottom={lowest_blob_bottom}, "
+                f"reason={rear_signal_reason}, "
+                f"signal={rear_car_signal}, cooldown={shared_data['trailing_escape_cooldown']}"
+            )
+
+        if confirmed_rear_car:
             evade_back_car = True
             # Check which side has more space or default a structural escape jump
             back_steering_escape = 1.0  # Tap right to clear the lane [cite: 153, 156]
+            with data_lock:
+                current_lane_for_escape = shared_data.get('current_lane', 1)
+            back_steering_escape = choose_trailing_escape_direction(current_lane_for_escape)
+            print(
+                "Trailing Car Alert! "
+                f"{TRAILING_DEBUG_VERSION} "
+                f"avg={avg_intensity:.1f}, contrast={contrast:.1f}, "
+                f"edges={edge_density:.3f}, lower={lower_edge_density:.3f}, "
+                f"blob={largest_edge_blob:.0f}, bottom={lowest_blob_bottom}, "
+                f"reason={rear_signal_reason}, steering={back_steering_escape}"
+            )
 
     # ---------------------------------------------------------
     # FRONT CAMERA ENVIRONMENT ANALYSIS (Token Processing)
@@ -1102,7 +1248,10 @@ def processing_task():
         police_urgent_avoidance = False
 
         # Decision State Hierarchy [cite: 15]
-        if police_collision_imminent:
+        if evade_back_car:
+            steering_target = back_steering_escape
+            print(f"Trailing Car Alert! Escaping to steering: {steering_target}")
+        elif police_collision_imminent:
             # Priority 1: Do not hit the police car head-on
             steering_target = police_escape_steering
             police_urgent_avoidance = True
@@ -1213,7 +1362,23 @@ def processing_task():
                 shared_data['tap_steering'] = 0.0
                 shared_data['steering_input'] = 0.0
 
-            if police_urgent_avoidance and steering_target != 0.0:
+            if evade_back_car:
+                shared_data['tap_steering'] = back_steering_escape
+                shared_data['tap_timer'] = TRAILING_TAP_FRAMES
+                shared_data['cooldown_timer'] = 0
+                shared_data['steering_input'] = back_steering_escape
+                shared_data['trailing_detect_count'] = 0
+                shared_data['trailing_escape_cooldown'] = TRAILING_ESCAPE_COOLDOWN_FRAMES
+                shared_data['trailing_escape_send_timer'] = TRAILING_TAP_FRAMES
+                shared_data['light_signal_timer'] = 0
+                lane_delta = -1 if back_steering_escape < 0 else 1
+                shared_data['target_lane'] = int(np.clip(shared_data.get('current_lane', 1) + lane_delta, 0, 2))
+                shared_data['current_lane'] = shared_data['target_lane']
+                print(
+                    "Initiating Trailing Escape! "
+                    f"Steering: {back_steering_escape}, lane={shared_data['current_lane']}"
+                )
+            elif police_urgent_avoidance and steering_target != 0.0:
                 # Police avoidance must bypass the normal tap/cooldown rhythm.
                 if shared_data['police_avoid_timer'] <= 0:
                     shared_data['police_avoid_timer'] = POLICE_AVOID_HOLD_FRAMES
@@ -1436,9 +1601,16 @@ def send_controls_task():
         steering_to_send = shared_data['steering_input']
         police_avoid_active = shared_data['police_avoid_timer'] > 0
         police_avoid_acceleration = shared_data['police_avoid_acceleration']
+        trailing_escape_active = shared_data['trailing_escape_send_timer'] > 0
+        if trailing_escape_active:
+            shared_data['trailing_escape_send_timer'] -= 1
+            shared_data['light_signal_timer'] = 0
         # NEW: Darkness Improvement
         # Unity treats acceleration -1.0 during darkness as the light recovery command.
-        if shared_data['light_signal_timer'] > 0:
+        if trailing_escape_active:
+            steering_to_send = shared_data['tap_steering']
+            acceleration_to_send = 1.0
+        elif shared_data['light_signal_timer'] > 0:
             shared_data['light_signal_timer'] -= 1
             steering_to_send = 0.0
             acceleration_to_send = LIGHT_TOGGLE_ACCELERATION
