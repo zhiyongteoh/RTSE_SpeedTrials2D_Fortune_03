@@ -919,6 +919,10 @@ def processing_task():
         back_roi = gray_back[120:240, 60:260]
         avg_intensity = np.mean(back_roi)
         contrast = np.std(back_roi)
+        edge_density = 0.0
+        lower_edge_density = 0.0
+        upper_edge_density = 0.0
+        contours = []
 
         # Brightness alone was too sensitive, so require stronger brightness + contrast.
         if (avg_intensity > 225 or avg_intensity < 25) and contrast > 18:
