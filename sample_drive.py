@@ -29,6 +29,7 @@ shared_data = {
     'low_brightness': False,  # Event flag
     # NEW: Darkness Improvement
     'front_brightness': 255.0,
+    'last_front_brightness': 255.0,
     'darkness_enter_count': 0,
     'darkness_exit_count': 0,
     'lights_on': False,
@@ -162,17 +163,18 @@ POLICE_KERNEL = np.ones((5, 5), np.uint8)
 # NEW: Darkness Improvement Configuration
 # ---------------------------------------------------------
 # Enter/exit Darkness Mode only after several frames so it does not flicker.
-DARKNESS_ENTER_THRESHOLD = 60.0
-DARKNESS_ENTER_FRAMES = 4
-DARKNESS_EXIT_THRESHOLD = 72.0
-DARKNESS_EXIT_FRAMES = 8
+DARKNESS_ENTER_THRESHOLD = 42.0
+DARKNESS_ENTER_FRAMES = 2
+DARKNESS_EXIT_THRESHOLD = 58.0
+DARKNESS_EXIT_FRAMES = 10
+DARKNESS_EMERGENCY_THRESHOLD = 24.0
+DARKNESS_DROP_THRESHOLD = 16.0
+DARKNESS_DROP_TARGET_THRESHOLD = 35.0
 
-# Extremely dark scene: avoid danger first, skip optional green chasing.
-CRITICAL_DARKNESS_THRESHOLD = 38.0
+CRITICAL_DARKNESS_THRESHOLD = 35.0
 
-# Slow down and reduce unnecessary steering during low visibility.
-DARKNESS_ACCELERATION = 0.76
-CRITICAL_DARKNESS_ACCELERATION = 0.62
+DARKNESS_ACCELERATION = 0.35
+CRITICAL_DARKNESS_ACCELERATION = 0.15
 LIGHT_TOGGLE_ACCELERATION = -1.0
 LIGHT_TOGGLE_FRAMES = 6
 NORMAL_TAP_FRAMES = 14          # Increased: Stronger steering duration
@@ -489,14 +491,35 @@ def set_vehicle_light(is_on, brightness):
 
 def update_darkness_state(brightness):
     """
-    Prevent Darkness Mode from switching on/off because of one unusual frame.
+    Detect EV1 Darkness reliably.
+
+    Fix: when the camera brightness suddenly drops from around 35+ to 10+,
+    do not wait for several frames. Enter Darkness Mode immediately and keep
+    sending acceleration_input = -1.0 for enough frames for Unity to open light.
     """
     with data_lock:
-        shared_data['front_brightness'] = float(brightness)
+        previous_brightness = float(shared_data.get('front_brightness', brightness))
+        brightness = float(brightness)
+        brightness_drop = previous_brightness - brightness
+
+        shared_data['last_front_brightness'] = previous_brightness
+        shared_data['front_brightness'] = brightness
+
+        instant_darkness = (
+            brightness <= DARKNESS_EMERGENCY_THRESHOLD
+            or (
+                previous_brightness >= DARKNESS_DROP_TARGET_THRESHOLD
+                and brightness <= DARKNESS_DROP_TARGET_THRESHOLD
+                and brightness_drop >= DARKNESS_DROP_THRESHOLD
+            )
+        )
 
         if not shared_data['low_brightness']:
             shared_data['darkness_exit_count'] = 0
-            if brightness < DARKNESS_ENTER_THRESHOLD:
+
+            if instant_darkness:
+                shared_data['darkness_enter_count'] = DARKNESS_ENTER_FRAMES
+            elif brightness < DARKNESS_ENTER_THRESHOLD:
                 shared_data['darkness_enter_count'] += 1
             else:
                 shared_data['darkness_enter_count'] = 0
@@ -505,9 +528,21 @@ def update_darkness_state(brightness):
                 shared_data['low_brightness'] = True
                 shared_data['darkness_enter_count'] = 0
                 set_vehicle_light(True, brightness)
-                print(f"Darkness Mode ON | brightness={brightness:.1f}")
+                shared_data['light_signal_timer'] = max(
+                    shared_data['light_signal_timer'],
+                    LIGHT_TOGGLE_FRAMES
+                )
+                print(
+                    f"Darkness Mode ON | brightness={brightness:.1f} | "
+                    f"prev={previous_brightness:.1f} | drop={brightness_drop:.1f}"
+                )
         else:
             shared_data['darkness_enter_count'] = 0
+
+            # Do not keep resetting light_signal_timer while it is dark.
+            # If we reset it every frame, acceleration_input stays -1.0 forever
+            # and the car will reverse.
+
             if brightness > DARKNESS_EXIT_THRESHOLD:
                 shared_data['darkness_exit_count'] += 1
             else:
@@ -516,6 +551,7 @@ def update_darkness_state(brightness):
             if shared_data['darkness_exit_count'] >= DARKNESS_EXIT_FRAMES:
                 shared_data['low_brightness'] = False
                 shared_data['darkness_exit_count'] = 0
+                shared_data['light_signal_timer'] = 0
                 set_vehicle_light(False, brightness)
                 print(f"Darkness Mode OFF | brightness={brightness:.1f}")
 
@@ -1612,21 +1648,26 @@ def send_controls_task():
         # NEW: Darkness Improvement
         # Unity treats acceleration -1.0 during darkness as the light recovery command.
         if trailing_escape_active:
-            steering_to_send = shared_data['tap_steering']
-            acceleration_to_send = 1.0
-        elif shared_data['light_signal_timer'] > 0:
+            shared_data['trailing_escape_send_timer'] -= 1
+
+        # Highest priority: EV1 requires acceleration_input = -1.0 to brake/open light.
+        # Do not let trailing/police logic cancel the light command.
+        if shared_data['light_signal_timer'] > 0:
             shared_data['light_signal_timer'] -= 1
             steering_to_send = 0.0
             acceleration_to_send = LIGHT_TOGGLE_ACCELERATION
-        elif police_avoid_active:
-            acceleration_to_send = police_avoid_acceleration
         elif shared_data['low_brightness']:
             if shared_data['front_brightness'] < CRITICAL_DARKNESS_THRESHOLD:
                 acceleration_to_send = CRITICAL_DARKNESS_ACCELERATION
             else:
                 acceleration_to_send = DARKNESS_ACCELERATION
+        elif trailing_escape_active:
+            steering_to_send = shared_data['tap_steering']
+            acceleration_to_send = 1.0
+        elif police_avoid_active:
+            acceleration_to_send = police_avoid_acceleration
         else:
-            acceleration_to_send = 1.0 # Default: full gas ahead [cite: 174]
+            acceleration_to_send = 1.0
 
     try:
         # Pack and send the control command to Unity [cite: 177]
