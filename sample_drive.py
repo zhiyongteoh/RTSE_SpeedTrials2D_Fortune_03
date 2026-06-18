@@ -7,6 +7,7 @@ import time
 import keyboard
 import select
 import ctypes
+import os
 
 # ---------------------------------------------------------
 # Configuration
@@ -37,23 +38,35 @@ shared_data = {
     'tap_timer': 0,
     'cooldown_timer': 0,
     'tap_steering': 0.0,
-    'police_active': False,   # Dynamic tracking state for police event
+    'police_active': False,
     'police_timer': 0,
     'police_detect_count': 0,
     'police_rearm_timer': 0,
     'police_memory_timer': 0,
     'police_memory_score': 0.0,
-    'police_last_position': None,  # NEW: Trajectory prediction
-    'police_velocity': None,       # NEW: Estimated movement direction
+    'police_last_position': None,
+    'police_velocity': None,
     'police_avoid_timer': 0,
     'police_avoid_steering': 0.0,
     'police_avoid_acceleration': 0.25,
+    'police_red_attempted': False,
+    'police_debug_capture_cooldown': 0,
     'red_detect_count': 0,
     'yellow_detect_count': 0,
     'trailing_detect_count': 0,
     'trailing_escape_cooldown': 0,
     'trailing_escape_send_timer': 0,
-    'trailing_debug_tick': 0
+    'trailing_debug_tick': 0,
+    'race_elapsed': 0.0,
+    'race_phase': 0.0,
+    'race_game_state': 'WAIT',  # WAIT / RUN / DONE
+    'race_last_timestamp': None,
+    'race_prev_motion_frame': None,
+    'race_motion_score': 0.0,
+    'race_motion_active': False,
+    'race_move_frames': 0,
+    'race_still_frames': 0,
+    'debug_screenshot_count': 0
 }
 data_lock = threading.Lock()
 is_running = True
@@ -100,36 +113,64 @@ RIGHT_SHOULDER_REJECT_MARGIN = 18
 # ---------------------------------------------------------
 # Police Event Configuration
 # ---------------------------------------------------------
-# The lecturer clarified that the police car appears in the front camera,
-# so detect a large red+blue vehicle shape ahead instead of using the back view.
 TASK_PERIOD_SECONDS = 0.033
-POLICE_EVENT_SECONDS = 10.0
+
+# ---------------------------------------------------------
+# Game Day Race Clock Configuration
+# ---------------------------------------------------------
+RACE_DURATION_SECONDS = 180.0
+RACE_PHASE_SECONDS = 60.0
+RACE_MOTION_THRESHOLD = 1.15
+RACE_MOTION_ENTER_FRAMES = 3
+RACE_MOTION_EXIT_FRAMES = 8
+RACE_CLOCK_MAX_DELTA = 0.20
+RACE_AUTO_RESET_STILL_FRAMES = 90
+RACE_AUTO_RESET_MIN_ELAPSED = 1.0
+RACE_CLOCK_ROI_TOP = 78
+RACE_CLOCK_ROI_BOTTOM = 190
+RACE_CLOCK_ROI_LEFT = 42
+RACE_CLOCK_ROI_RIGHT = 278
+POLICE_PHASE_START_SECONDS = 28.0
+POLICE_PHASE_END_SECONDS = 52.0
+POLICE_EVENT_SECONDS = 5.0
 POLICE_EVENT_FRAMES = max(1, int(POLICE_EVENT_SECONDS / TASK_PERIOD_SECONDS))
 POLICE_CONFIRM_FRAMES = 2
 POLICE_REARM_FRAMES = 30
-POLICE_MIN_COLOR_AREA = 85   # Further relaxed: catch smaller color components
-POLICE_MIN_COMBINED_AREA = 350  # Further relaxed: lower combined threshold
+POLICE_MIN_COLOR_AREA = 85
+POLICE_MIN_COMBINED_AREA = 350
 POLICE_MIN_BOTTOM_Y = 102
-POLICE_MAX_CENTER_GAP_X = 120  # Further relaxed: allow more red-blue separation
-POLICE_MAX_CENTER_GAP_Y = 70   # Further relaxed: allow more vertical separation
-POLICE_MIN_WIDTH = 36   # Further relaxed: detect smaller vehicles
-POLICE_MIN_HEIGHT = 16  # Further relaxed: detect smaller vehicles
-POLICE_MAX_ASPECT = 4.0  # Further relaxed: more aspect ratio tolerance
-POLICE_MIN_FILL_RATIO = 0.08  # Further relaxed: accept more fragmented detections
-POLICE_MIN_LANE_COVERAGE = 0.10  # Further relaxed: less strict road coverage
-POLICE_STRONG_LANE_COVERAGE = 0.25  # Further relaxed: lower confidence requirement
+POLICE_MAX_CENTER_GAP_X = 120
+POLICE_MAX_CENTER_GAP_Y = 70
+POLICE_MIN_WIDTH = 36
+POLICE_MIN_HEIGHT = 16
+POLICE_MAX_ASPECT = 4.0
+POLICE_MIN_FILL_RATIO = 0.08
+POLICE_MIN_LANE_COVERAGE = 0.10
+POLICE_STRONG_LANE_COVERAGE = 0.25
 POLICE_BLUE_MAX_VALUE = 210
+POLICE_DEBUG_DIR = 'police_debug'
+POLICE_DEBUG_CAPTURE_COOLDOWN_FRAMES = 12
+POLICE_DEBUG_CAPTURE_SCORE_MIN = 30.0
+# Code-only switch for automatic police screenshots.
+# True  = save a screenshot whenever the detector sees a police candidate.
+# False = disable all automatic police screenshots for better FPS.
+POLICE_DEBUG_CAPTURE_ENABLED = False
 POLICE_LANE_GUIDE_DILATE_ITERS = 3
 POLICE_MEMORY_FRAMES = 12
-POLICE_MEMORY_MIN_SCORE = 80.0  # Much lower: easier activation with memory
-POLICE_CAPTURE_MIN_BOTTOM = 150
-POLICE_CAPTURE_MAX_ERROR = 20
+POLICE_MEMORY_MIN_SCORE = 9999.0
+POLICE_CAPTURE_MIN_BOTTOM = 175
+POLICE_CAPTURE_MAX_ERROR = 14
 POLICE_MIN_VERTICAL_OVERLAP_RATIO = 0.02
-POLICE_EVADE_BOTTOM_Y = 120     # MUCH EARLIER: Start dodging at 120 instead of 150
-POLICE_EVADE_WIDTH = 40         # Reduced: Trigger earlier with smaller police
-POLICE_EVADE_CENTER_MARGIN = 30 # Increased: More aggressive dodging trigger
+POLICE_EVADE_BOTTOM_Y = 120
+POLICE_EVADE_WIDTH = 40
+POLICE_EVADE_CENTER_MARGIN = 30
 POLICE_AVOID_HOLD_FRAMES = 14
 POLICE_AVOID_ACCELERATION = 0.18
+POLICE_HARD_DODGE_SCORE = 120.0
+POLICE_HARD_DODGE_BOTTOM_Y = 112
+POLICE_HARD_DODGE_WIDTH = 30
+POLICE_HARD_DODGE_HOLD_FRAMES = 24
+POLICE_HARD_DODGE_ACCELERATION = 0.68
 POLICE_COLLISION_AVOID_HOLD_FRAMES = 18
 POLICE_COLLISION_BRAKE_ACCELERATION = -0.35
 POLICE_COLLISION_BOTTOM_Y = 122
@@ -151,10 +192,10 @@ POLICE_SUDDEN_CENTER_MARGIN = 35  # More tolerance
 POLICE_BOX_PAD_X = 0.45
 POLICE_BOX_PAD_TOP = 0.35
 POLICE_BOX_PAD_BOTTOM = 0.55
-POLICE_ROI_TOP = 100      # Adjusted: Focus on road area, reduce false sky/tree detections
-POLICE_ROI_BOTTOM = 220
-POLICE_ROI_LEFT = 30      # EXPANDED: Extended left to catch police in wider area
-POLICE_ROI_RIGHT = 290    # EXPANDED: Extended right to catch police in wider area
+POLICE_ROI_TOP = 100     
+POLICE_ROI_BOTTOM = 220  
+POLICE_ROI_LEFT = 12    
+POLICE_ROI_RIGHT = 308    
 
 POLICE_KERNEL = np.ones((5, 5), np.uint8)
 
@@ -571,6 +612,214 @@ def enhance_low_light_frame(frame):
     return cv2.cvtColor(enhanced_hsv, cv2.COLOR_HSV2BGR)
 
 
+def extract_race_motion_frame(small_frame):
+    """Return a compact road ROI used only to decide whether the simulator moves."""
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+    roi = gray[
+        RACE_CLOCK_ROI_TOP:RACE_CLOCK_ROI_BOTTOM,
+        RACE_CLOCK_ROI_LEFT:RACE_CLOCK_ROI_RIGHT,
+    ]
+    roi = cv2.resize(roi, (96, 48), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(roi, (5, 5), 0)
+
+
+def update_race_clock_from_frame(small_frame):
+    """
+    Advance the 180s Game Day clock only while the simulator image is moving.
+    If the simulator stays stopped after a run/reset, automatically restart
+    the Python race clock so the next moving run begins from 0.0s.
+    """
+    now = time.monotonic()
+    current_motion_frame = extract_race_motion_frame(small_frame)
+
+    with data_lock:
+        previous_motion_frame = shared_data['race_prev_motion_frame']
+        last_timestamp = shared_data['race_last_timestamp']
+        elapsed = shared_data['race_elapsed']
+        motion_active = shared_data['race_motion_active']
+        move_frames = shared_data['race_move_frames']
+        still_frames = shared_data['race_still_frames']
+
+    if previous_motion_frame is None:
+        motion_score = 0.0
+        raw_moving = False
+    else:
+        motion_score = float(
+            np.mean(cv2.absdiff(previous_motion_frame, current_motion_frame))
+        )
+        raw_moving = motion_score >= RACE_MOTION_THRESHOLD
+
+    if raw_moving:
+        move_frames += 1
+        still_frames = 0
+    else:
+        still_frames += 1
+        move_frames = 0
+
+    if not motion_active and move_frames >= RACE_MOTION_ENTER_FRAMES:
+        motion_active = True
+    elif motion_active and still_frames >= RACE_MOTION_EXIT_FRAMES:
+        motion_active = False
+
+    if last_timestamp is None:
+        dt = 0.0
+    else:
+        dt = max(0.0, min(now - last_timestamp, RACE_CLOCK_MAX_DELTA))
+
+    if elapsed < RACE_DURATION_SECONDS and motion_active:
+        elapsed = min(RACE_DURATION_SECONDS, elapsed + dt)
+
+    if elapsed >= RACE_DURATION_SECONDS:
+        game_state = 'DONE'
+        motion_active = False
+    elif motion_active:
+        game_state = 'RUN'
+    else:
+        game_state = 'WAIT'
+
+    auto_reset_due = (
+        elapsed >= RACE_AUTO_RESET_MIN_ELAPSED
+        and not motion_active
+        and still_frames >= RACE_AUTO_RESET_STILL_FRAMES
+    )
+
+    if auto_reset_due:
+        elapsed = 0.0
+        phase = 0.0
+        game_state = 'WAIT'
+        motion_active = False
+        move_frames = 0
+        still_frames = 0
+    else:
+        phase = elapsed % RACE_PHASE_SECONDS
+
+    with data_lock:
+        if auto_reset_due:
+            # Reset Python-side driving/event state only after the simulator has
+            shared_data.update({
+                'steering_input': 0.0,
+                'acceleration_input': 1.0,
+                'target_lane': 1,
+                'current_lane': 1,
+                'low_brightness': False,
+                'front_brightness': 255.0,
+                'darkness_enter_count': 0,
+                'darkness_exit_count': 0,
+                'lights_on': False,
+                'light_signal_timer': 0,
+                'tap_timer': 0,
+                'cooldown_timer': 0,
+                'tap_steering': 0.0,
+                'police_active': False,
+                'police_timer': 0,
+                'police_detect_count': 0,
+                'police_rearm_timer': 0,
+                'police_memory_timer': 0,
+                'police_memory_score': 0.0,
+                'police_last_position': None,
+                'police_velocity': None,
+                'police_avoid_timer': 0,
+                'police_avoid_steering': 0.0,
+                'police_avoid_acceleration': POLICE_AVOID_ACCELERATION,
+                'police_red_attempted': False,
+                'police_debug_capture_cooldown': 0,
+                'red_detect_count': 0,
+                'yellow_detect_count': 0,
+                'trailing_detect_count': 0,
+                'trailing_escape_cooldown': 0,
+                'trailing_escape_send_timer': 0,
+                'trailing_debug_tick': 0,
+            })
+
+        shared_data['race_prev_motion_frame'] = current_motion_frame
+        shared_data['race_last_timestamp'] = now
+        shared_data['race_elapsed'] = elapsed
+        shared_data['race_phase'] = phase
+        shared_data['race_game_state'] = game_state
+        shared_data['race_motion_active'] = motion_active
+        shared_data['race_motion_score'] = motion_score
+        shared_data['race_move_frames'] = move_frames
+        shared_data['race_still_frames'] = still_frames
+
+    if auto_reset_due:
+        print(
+            "Race clock auto reset after simulator stopped. "
+            "Next moving run will start from 0.0s."
+        )
+
+    return game_state, elapsed, phase
+
+
+def reset_runtime_state(reason='manual'):
+    """
+    Reset Python-side timers/states after restarting the simulator.
+    Screenshot enable/disable is controlled only by POLICE_DEBUG_CAPTURE_ENABLED.
+    """
+    with data_lock:
+        screenshot_count = shared_data.get('debug_screenshot_count', 0)
+
+        shared_data.update({
+            # Control state
+            'steering_input': 0.0,
+            'acceleration_input': 1.0,
+            'target_lane': 1,
+            'current_lane': 1,
+
+            # Darkness / light state
+            'low_brightness': False,
+            'front_brightness': 255.0,
+            'darkness_enter_count': 0,
+            'darkness_exit_count': 0,
+            'lights_on': False,
+            'light_signal_timer': 0,
+
+            # Steering tap / cooldown state
+            'tap_timer': 0,
+            'cooldown_timer': 0,
+            'tap_steering': 0.0,
+
+            # Police event state
+            'police_active': False,
+            'police_timer': 0,
+            'police_detect_count': 0,
+            'police_rearm_timer': 0,
+            'police_memory_timer': 0,
+            'police_memory_score': 0.0,
+            'police_last_position': None,
+            'police_velocity': None,
+            'police_avoid_timer': 0,
+            'police_avoid_steering': 0.0,
+            'police_avoid_acceleration': POLICE_AVOID_ACCELERATION,
+            'police_red_attempted': False,
+            'police_debug_capture_cooldown': 0,
+
+            # Token / rear-car state
+            'red_detect_count': 0,
+            'yellow_detect_count': 0,
+            'trailing_detect_count': 0,
+            'trailing_escape_cooldown': 0,
+            'trailing_escape_send_timer': 0,
+            'trailing_debug_tick': 0,
+
+            # 180s Game Day race clock state
+            'race_elapsed': 0.0,
+            'race_phase': 0.0,
+            'race_game_state': 'WAIT',
+            'race_last_timestamp': None,
+            'race_prev_motion_frame': None,
+            'race_motion_score': 0.0,
+            'race_motion_active': False,
+            'race_move_frames': 0,
+            'race_still_frames': 0,
+
+        })
+
+        # Preserve total saved screenshot count only.
+        shared_data['debug_screenshot_count'] = screenshot_count
+
+    print(f"Python runtime state reset ({reason}). game=WAIT 0.0s | phase=0.0s")
+
+
 def evaluate_trailing_signal(
     avg_intensity,
     contrast,
@@ -847,7 +1096,151 @@ def detect_front_police_car(base_frame, road_mask):
     return False, debug_info
 
 
-def update_police_state(police_seen, police_score=0.0, red_token_captured=False, police_position=None):
+def boxes_overlap(box_a, box_b, pad=0):
+    """Return True when two bounding boxes overlap. Used to ignore police-body red pixels."""
+    if box_a is None or box_b is None:
+        return False
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ax1, ay1 = ax - pad, ay - pad
+    ax2, ay2 = ax + aw + pad, ay + ah + pad
+    bx1, by1 = bx, by
+    bx2, by2 = bx + bw, by + bh
+    return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+
+def is_strong_police_event_candidate(police_debug):
+    """
+    Strict gate for starting the formal EV2 5s red-token mission.
+    policeTime=ON only means the event can happen; police=ON starts only when
+    a strong red+blue police-car candidate is visible.
+    """
+    if not police_debug.get('seen'):
+        return False
+
+    raw_box = police_debug.get('raw_candidate_box')
+    candidate_box = police_debug.get('candidate_box')
+    if raw_box is None or candidate_box is None:
+        return False
+
+    _, raw_y, raw_w, raw_h = raw_box
+    _, cand_y, cand_w, cand_h = candidate_box
+    score = float(police_debug.get('score', 0.0))
+    area = int(police_debug.get('combined_area', 0))
+    fill = float(police_debug.get('fill_ratio', 0.0))
+    lane = float(police_debug.get('lane_coverage', 0.0))
+    cand_bottom = cand_y + cand_h
+    raw_bottom = raw_y + raw_h
+
+    # Main gate: strong enough for real police-car detection but still catches
+    # fast/near police cars like score≈360, area≈360, fill≈0.34.
+    strong_shape = (
+        score >= 130.0
+        and area >= 250
+        and fill >= 0.10
+        and lane >= 0.10
+        and cand_bottom >= 104
+        and raw_bottom >= 100
+        and cand_w >= 30
+        and raw_w >= 20
+        and raw_h >= 10
+    )
+
+    # Backup gate for very confident but partially clipped close police cars.
+    very_confident_close = (
+        score >= 220.0
+        and area >= 160
+        and fill >= 0.08
+        and lane >= 0.08
+        and cand_bottom >= 96
+        and raw_w >= 18
+        and raw_h >= 8
+    )
+
+    return strong_shape or very_confident_close
+
+
+def choose_police_red_token(filtered_red_contours, police_raw_box, police_candidate_box, frame_center):
+    """
+    Pick the real EV2 red token during police=ON.
+    Important: do not use largest_red. That often chooses police lights,
+    red road shoulder, or red noise. This function rejects red contours that
+    overlap the police box and scores token-like blobs by bottom/area/path.
+    """
+    best = None
+
+    for contour in filtered_red_contours:
+        area = cv2.contourArea(contour)
+        if area <= 5:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        box = (x, y, w, h)
+
+        # Red pixels inside/near the police bbox are part of the police car,
+        # not the red token we need to catch.
+        if boxes_overlap(box, police_raw_box, pad=10):
+            continue
+        if boxes_overlap(box, police_candidate_box, pad=8):
+            continue
+
+        M = cv2.moments(contour)
+        if M['m00'] <= 0:
+            continue
+
+        cx = int(M['m10'] / M['m00'])
+        cy = int(M['m01'] / M['m00'])
+        bottom = y + h
+        center_error = abs(cx - frame_center)
+
+        score = (
+            area * 0.85
+            + bottom * 2.25
+            + h * 1.30
+            - center_error * 0.35
+            - max(0, 95 - bottom) * 1.4
+        )
+
+        item = {
+            'contour': contour,
+            'x': x,
+            'y': y,
+            'w': w,
+            'h': h,
+            'cx': cx,
+            'cy': cy,
+            'bottom': bottom,
+            'area': area,
+            'score': score,
+        }
+
+        if best is None or item['score'] > best['score']:
+            best = item
+
+    return best
+
+
+def save_police_debug_capture(debug_frame, police_debug, reason):
+    """Save an automatic police debug screenshot when police detection triggers."""
+    if debug_frame is None:
+        return
+
+    os.makedirs(POLICE_DEBUG_DIR, exist_ok=True)
+    now = time.time()
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+    milliseconds = int((now % 1) * 1000)
+    score = int(float(police_debug.get('score', 0.0)))
+    base_name = f"{timestamp}_{milliseconds:03d}_{reason}_s{score}"
+    debug_path = os.path.join(POLICE_DEBUG_DIR, f"{base_name}_debug.png")
+
+    if cv2.imwrite(debug_path, debug_frame):
+        with data_lock:
+            shared_data['debug_screenshot_count'] += 1
+        print(f"Police debug capture saved: {debug_path}")
+
+
+
+def update_police_state(police_seen, police_score=0.0, red_token_captured=False, police_position=None, allow_activation=True):
     """
     Keep the police event self-contained so the rest of the driving logic
     does not need to change.
@@ -875,13 +1268,10 @@ def update_police_state(police_seen, police_score=0.0, red_token_captured=False,
             shared_data['police_rearm_timer'] -= 1
 
         if red_token_captured:
-            shared_data['police_active'] = False
-            shared_data['police_timer'] = 0
-            shared_data['police_detect_count'] = 0
-            shared_data['police_rearm_timer'] = POLICE_REARM_FRAMES
-            shared_data['police_memory_timer'] = 0
-            shared_data['police_memory_score'] = 0.0
-            print("Police Event cleared by collecting a red token.")
+            if shared_data['police_active']:
+                shared_data['police_red_attempted'] = True
+                print("Police red token reached; keeping police=ON until timer ends.")
+                return True
             return False
 
         if shared_data['police_active']:
@@ -893,10 +1283,18 @@ def update_police_state(police_seen, police_score=0.0, red_token_captured=False,
                 shared_data['police_rearm_timer'] = POLICE_REARM_FRAMES
                 shared_data['police_memory_timer'] = 0
                 shared_data['police_memory_score'] = 0.0
-                print("Police Event ended after 10 seconds.")
+                shared_data['police_red_attempted'] = False
+                print(f"Police Event ended after {POLICE_EVENT_SECONDS:.0f} seconds.")
             return shared_data['police_active']
 
         if shared_data['police_rearm_timer'] > 0:
+            shared_data['police_detect_count'] = 0
+            shared_data['police_memory_timer'] = 0
+            shared_data['police_memory_score'] = 0.0
+            return False
+
+        # 30s-50s phase window (with margin). Detection may still run
+        if not allow_activation:
             shared_data['police_detect_count'] = 0
             shared_data['police_memory_timer'] = 0
             shared_data['police_memory_score'] = 0.0
@@ -909,15 +1307,13 @@ def update_police_state(police_seen, police_score=0.0, red_token_captured=False,
                 float(police_score),
             )
             shared_data['police_detect_count'] += 1
-            if (
-                shared_data['police_detect_count'] >= POLICE_CONFIRM_FRAMES
-                or shared_data['police_memory_score'] >= POLICE_MEMORY_MIN_SCORE
-            ):
+            if shared_data['police_detect_count'] >= POLICE_CONFIRM_FRAMES:
                 shared_data['police_active'] = True
                 shared_data['police_timer'] = POLICE_EVENT_FRAMES
                 shared_data['police_detect_count'] = 0
                 shared_data['police_memory_timer'] = 0
                 shared_data['police_memory_score'] = 0.0
+                shared_data['police_red_attempted'] = False
                 print("Police Event detected in front camera.")
         else:
             if shared_data['police_memory_timer'] > 0:
@@ -1047,6 +1443,7 @@ def processing_task():
     # ---------------------------------------------------------
     if front_frame is not None:
         small_frame = cv2.resize(front_frame, (320, 240))
+        game_state, race_elapsed, race_phase = update_race_clock_from_frame(small_frame)
         
         # ---------------------------------------------------------
         # NEW: Darkness Improvement
@@ -1120,14 +1517,23 @@ def processing_task():
         mask_grey = cv2.bitwise_and(mask_grey, road_mask)
 
         police_seen, police_debug = detect_front_police_car(small_frame, road_mask)
+        police_phase_window = (
+            POLICE_PHASE_START_SECONDS <= race_phase <= POLICE_PHASE_END_SECONDS
+        )
         police_position = None
         if police_debug.get('raw_candidate_box') is not None:
             x, y, w, h = police_debug['raw_candidate_box']
             police_position = (x + w // 2, y + h)  # (center_x, bottom_y)
+
+        police_event_seen = (
+            police_phase_window
+            and is_strong_police_event_candidate(police_debug)
+        )
         police_mode = update_police_state(
-            police_seen,
+            police_event_seen,
             police_score=police_debug.get('score', 0.0),
-            police_position=police_position,
+            police_position=police_position if police_event_seen else None,
+            allow_activation=police_phase_window,
         )
 
         # NEW: Darkness Improvement - reconnect small broken token regions.
@@ -1204,93 +1610,145 @@ def processing_task():
         police_sudden_risk = False
         police_alert_active = False
         police_collision_imminent = False
+        police_hard_immediate_dodge = False
         police_escape_steering = 0.0
 
         if police_raw_box is not None:
+            if police_candidate_box is not None:
+                px, py, pw, ph = police_candidate_box
+            else:
+                px, py, pw, ph = police_raw_box
+
             rx, ry, rw, rh = police_raw_box
-            police_center_x = rx + (rw // 2)
-            police_bottom = ry + rh
             police_score = float(police_debug.get('score', 0.0))
-            police_left = rx
-            police_right = rx + rw
+
+            police_center_x = px + (pw // 2)
+            police_bottom = py + ph
+            police_left = px
+            police_right = px + pw
+
             ego_lane = pixel_x_to_debug_lane(frame_center, police_bottom)
             police_lane_left = pixel_x_to_debug_lane(police_left, police_bottom)
             police_lane_right = pixel_x_to_debug_lane(police_right, police_bottom)
             police_lane_min = min(police_lane_left, police_lane_right)
             police_lane_max = max(police_lane_left, police_lane_right)
-            police_blocks_ego_lane = police_lane_min <= ego_lane <= police_lane_max
-            police_alert_active = (
-                police_blocks_ego_lane
-                and police_bottom >= 80
-                and police_score >= 40
+            police_center_error = police_center_x - frame_center
+            police_center_margin = max(34, min(72, (pw // 2) + 26))
+            police_center_in_corridor = abs(police_center_error) <= police_center_margin
+            police_blocks_ego_lane = (
+                police_lane_min <= ego_lane <= police_lane_max
+                or police_center_in_corridor
             )
 
+            police_alert_active = (
+                police_blocks_ego_lane
+                and police_bottom >= 72
+                and police_score >= 35
+            )
+
+            police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
+
+            # HARD POLICE DODGE:
             if (
-                police_bottom >= POLICE_COLLISION_BOTTOM_Y
-                and rw >= POLICE_COLLISION_WIDTH
-                and abs(police_center_x - frame_center) <= (max(rw // 2, 18) + POLICE_COLLISION_CENTER_MARGIN)
+                police_phase_window
+                and police_score >= POLICE_HARD_DODGE_SCORE
+                and police_bottom >= POLICE_HARD_DODGE_BOTTOM_Y
+                and pw >= POLICE_HARD_DODGE_WIDTH
+            ):
+                police_hard_immediate_dodge = True
+                police_escape_steering = 1.0 if police_center_x < frame_center else -1.0
+                print(
+                    "HARD Police Immediate Dodge Trigger! "
+                    f"bottom={police_bottom}, width={pw}, score={police_score:.0f}, "
+                    f"err={police_center_error}, steering={police_escape_steering}"
+                )
+
+            if (
+                police_score >= 35
+                and police_bottom >= 108
+                and pw >= 24
+                and police_center_in_corridor
             ):
                 police_collision_imminent = True
-                police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
 
-            # NEW: CRITICAL - If police is detected in current lane, dodge immediately
-            # This is the highest priority detection logic
-            if not police_collision_imminent and police_blocks_ego_lane and police_bottom >= 80:
+
+            if not police_collision_imminent and police_blocks_ego_lane and police_bottom >= 74 and police_score >= 35:
                 police_detected_now = True
-                police_escape_steering = -1.0 if police_center_x > frame_center else 1.0
-                print(f"CRITICAL: Police in lane detected! Immediate dodge to: {police_escape_steering}")
-            
-            # NEW: Early warning - police approaching in lane, start micro-adjustment
-            elif police_blocks_ego_lane and police_bottom >= 70 and police_score >= 40:
-                # Pre-emptive slight steering to avoid collision path
-                steering_target = -0.5 if police_center_x > frame_center else 0.5
-                print(f"Early Warning: Police approaching lane, pre-steering: {steering_target}")
+                print(
+                    "CRITICAL: Police in corridor! "
+                    f"bottom={police_bottom}, width={pw}, score={police_score:.0f}, "
+                    f"err={police_center_error}, steering={police_escape_steering}"
+                )
+            elif police_blocks_ego_lane and police_bottom >= 66 and police_score >= 35:
+                # Pre-emptive slight steering if still far away.
+                steering_target = -0.5 if police_center_x >= frame_center else 0.5
+                print(
+                    "Early Warning: Police approaching corridor, "
+                    f"bottom={police_bottom}, score={police_score:.0f}, pre-steering={steering_target}"
+                )
 
             if (
                 police_score >= POLICE_INSTANT_SCORE
-                and police_bottom >= POLICE_INSTANT_BOTTOM_Y
-                and rw >= POLICE_INSTANT_WIDTH
-                and rh >= POLICE_INSTANT_HEIGHT
+                and police_bottom >= 74
+                and pw >= POLICE_INSTANT_WIDTH
+                and ph >= POLICE_INSTANT_HEIGHT
                 and police_blocks_ego_lane
-                and abs(police_center_x - frame_center) <= (rw // 2 + POLICE_INSTANT_CENTER_MARGIN)
+                and police_center_in_corridor
             ):
                 police_detected_now = True
-                police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
 
             if (
-                police_bottom >= POLICE_EVADE_BOTTOM_Y
-                and rw >= POLICE_EVADE_WIDTH
+                police_bottom >= 100
+                and pw >= 28
                 and police_blocks_ego_lane
-                and abs(police_center_x - frame_center) <= (rw // 2 + POLICE_EVADE_CENTER_MARGIN)
+                and police_center_in_corridor
             ):
                 police_obstacle_close = True
-                police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
             elif (
                 police_score >= POLICE_EMERGENCY_SCORE
-                and police_bottom >= POLICE_EMERGENCY_BOTTOM_Y
-                and rw >= POLICE_EMERGENCY_WIDTH
+                and police_bottom >= 90
+                and pw >= 26
                 and police_blocks_ego_lane
-                and abs(police_center_x - frame_center) <= (rw // 2 + POLICE_EVADE_CENTER_MARGIN + 10)
+                and police_center_in_corridor
             ):
                 police_emergency_close = True
-                police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
             elif (
                 police_score >= POLICE_SUDDEN_SCORE
-                and police_bottom >= POLICE_SUDDEN_BOTTOM_Y
-                and rw >= POLICE_SUDDEN_WIDTH
-                and rh >= POLICE_SUDDEN_HEIGHT
+                and police_bottom >= 82
+                and pw >= 22
+                and ph >= POLICE_SUDDEN_HEIGHT
                 and police_blocks_ego_lane
-                and abs(police_center_x - frame_center) <= (rw // 2 + POLICE_SUDDEN_CENTER_MARGIN)
+                and police_center_in_corridor
             ):
                 police_sudden_risk = True
-                police_escape_steering = -1.0 if police_center_x >= frame_center else 1.0
 
         police_urgent_avoidance = False
+        police_red_chase_active = False
 
         # Decision State Hierarchy [cite: 15]
-        if evade_back_car:
+        if (
+            evade_back_car
+            and not (
+                police_hard_immediate_dodge
+                or police_collision_imminent
+                or police_detected_now
+                or police_sudden_risk
+                or police_emergency_close
+                or (police_mode and police_obstacle_close)
+            )
+        ):
             steering_target = back_steering_escape
             print(f"Trailing Car Alert! Escaping to steering: {steering_target}")
+        elif police_hard_immediate_dodge:
+            # Absolute priority: police is already close/low in the front camera.
+            # Bypass red-token chasing and normal cooldown immediately.
+            steering_target = police_escape_steering
+            police_urgent_avoidance = True
+            with data_lock:
+                shared_data['police_avoid_timer'] = POLICE_HARD_DODGE_HOLD_FRAMES
+                shared_data['police_avoid_steering'] = steering_target
+                shared_data['police_avoid_acceleration'] = POLICE_HARD_DODGE_ACCELERATION
+            print(f"HARD Police Dodge NOW! Steering: {steering_target}")
         elif police_collision_imminent:
             # Priority 1: Do not hit the police car head-on
             steering_target = police_escape_steering
@@ -1326,30 +1784,50 @@ def processing_task():
             print(f"Emergency Police Avoidance! Steering: {steering_target}")
             
         elif police_mode:
-            # Priority 5: During a police event, avoid the police car first if
-            # it is about to collide, otherwise chase the next red token.
+            # Priority 5: During a confirmed police event, avoid the police car
+            # first. Only when it is safe, chase one real red token within the
+            # 5s window. Do not use largest_red because police lights/curb can
+            # be larger than the actual EV2 red token.
             if police_obstacle_close:
                 steering_target = police_escape_steering
                 police_urgent_avoidance = True
                 with data_lock:
                     shared_data['police_avoid_acceleration'] = POLICE_AVOID_ACCELERATION
                 print(f"Police Car Close! Evading to steering: {steering_target}")
-            elif filtered_red_contours:
-                largest_red = max(filtered_red_contours, key=cv2.contourArea)
-                if cv2.contourArea(largest_red) > 5:
-                    _, red_top, _, red_height = cv2.boundingRect(largest_red)
-                    M = cv2.moments(largest_red)
-                    if M['m00'] > 0:
-                        rx = int(M['m10'] / M['m00'])
-                        error = rx - frame_center
-                        steering_target = -1.0 if error < -15 else (1.0 if error > 15 else 0.0)
-                        red_bottom = red_top + red_height
-                        if abs(error) <= POLICE_CAPTURE_MAX_ERROR and red_bottom >= POLICE_CAPTURE_MIN_BOTTOM:
+            else:
+                with data_lock:
+                    red_already_attempted = shared_data.get('police_red_attempted', False)
+
+                if not red_already_attempted:
+                    red_target = choose_police_red_token(
+                        filtered_red_contours,
+                        police_raw_box,
+                        police_candidate_box,
+                        frame_center,
+                    )
+
+                    if red_target is not None:
+                        error = red_target['cx'] - frame_center
+                        steering_target = -1.0 if error < -12 else (1.0 if error > 12 else 0.0)
+                        police_red_chase_active = True
+                        print(
+                            "Police Red Chase! "
+                            f"cx={red_target['cx']}, err={error}, "
+                            f"bottom={red_target['bottom']}, area={red_target['area']:.0f}, "
+                            f"steer={steering_target}"
+                        )
+
+                        if (
+                            abs(error) <= POLICE_CAPTURE_MAX_ERROR
+                            and red_target['bottom'] >= POLICE_CAPTURE_MIN_BOTTOM
+                        ):
                             police_mode = update_police_state(
                                 False,
                                 police_score=0.0,
                                 red_token_captured=True,
                             )
+                else:
+                    steering_target = 0.0
 
         else:
             # Priority 3: Standard Navigation using the 5-Bucket Logic Engine
@@ -1402,7 +1880,7 @@ def processing_task():
                 shared_data['tap_steering'] = 0.0
                 shared_data['steering_input'] = 0.0
 
-            if evade_back_car:
+            if evade_back_car and not police_urgent_avoidance:
                 shared_data['tap_steering'] = back_steering_escape
                 shared_data['tap_timer'] = TRAILING_TAP_FRAMES
                 shared_data['cooldown_timer'] = 0
@@ -1431,6 +1909,12 @@ def processing_task():
             elif shared_data['police_avoid_timer'] > 0:
                 shared_data['police_avoid_timer'] -= 1
                 shared_data['steering_input'] = shared_data['police_avoid_steering']
+            elif police_red_chase_active and steering_target != 0.0:
+                shared_data['tap_steering'] = steering_target
+                shared_data['tap_timer'] = max(8, NORMAL_TAP_FRAMES // 2)
+                shared_data['cooldown_timer'] = 0
+                shared_data['steering_input'] = steering_target
+                print(f"Initiating Police Red Chase Tap! Steering: {steering_target}")
             elif shared_data['tap_timer'] > 0:
                 # State 1: Actively tapping [cite: 156]
                 shared_data['tap_timer'] -= 1
@@ -1541,45 +2025,76 @@ def processing_task():
                 cv2.LINE_AA,
             )
 
+        with data_lock:
+            overlay_game_state = shared_data['race_game_state']
+            overlay_race_elapsed = shared_data['race_elapsed']
+            overlay_phase = shared_data['race_phase']
+            overlay_police_time = (
+                POLICE_PHASE_START_SECONDS <= overlay_phase <= POLICE_PHASE_END_SECONDS
+            )
+            overlay_police_active = shared_data['police_active']
+            overlay_police_state = 'ON' if overlay_police_active else 'OFF'
+            overlay_police_timer = shared_data['police_timer'] * TASK_PERIOD_SECONDS
+            overlay_light_state = (
+                'SIGNAL'
+                if shared_data['light_signal_timer'] > 0
+                else ('ON' if shared_data['lights_on'] else 'OFF')
+            )
+
+        overlay_font_scale = 0.30
+        overlay_color = (255, 255, 255)
+
+        cv2.putText(
+            debug_frame,
+            (
+                f"game={overlay_game_state} {overlay_race_elapsed:.1f}s | "
+                f"phase={overlay_phase:.1f}s"
+            ),
+            (5, 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            overlay_font_scale,
+            overlay_color,
+            1,
+            cv2.LINE_AA,
+        )
+
         cv2.putText(
             debug_frame,
             (
                 f"mode={'DARKNESS' if low_brightness else 'NORMAL'} | "
-                f"light={'SIGNAL' if shared_data['light_signal_timer'] > 0 else ('ON' if shared_data['lights_on'] else 'OFF')} | "
+                f"light={overlay_light_state} | "
                 f"brightness={brightness:.1f}"
             ),
-            (5, 15),
+            (5, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (255, 255, 255),
+            overlay_font_scale,
+            overlay_color,
             1,
             cv2.LINE_AA,
         )
 
         cv2.putText(
             debug_frame,
-            f"lanes={NUM_LANES} | Scan Line Active",
-            (5, 31),
+            f"lanes={NUM_LANES} | scan line=ACTIVE",
+            (5, 36),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (255, 255, 255),
+            overlay_font_scale,
+            overlay_color,
             1,
             cv2.LINE_AA,
         )
 
-        with data_lock:
-            police_overlay = (
-                f"police={'ON' if shared_data['police_active'] else 'OFF'} | "
-                f"timer={shared_data['police_timer'] * TASK_PERIOD_SECONDS:.1f}s"
-            )
-
         cv2.putText(
             debug_frame,
-            police_overlay,
-            (5, 47),
+            (
+                f"policeTime={'ON' if overlay_police_time else 'OFF'} | "
+                f"police={overlay_police_state} | "
+                f"timer={overlay_police_timer:.1f}s"
+            ),
+            (5, 48),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (255, 255, 255),
+            overlay_font_scale,
+            overlay_color,
             1,
             cv2.LINE_AA,
         )
@@ -1589,11 +2104,6 @@ def processing_task():
 
         for x, y, w, h in police_debug.get('blue_boxes', []):
             cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (255, 0, 0), 1)
-
-        roi_box = police_debug.get('roi_box')
-        if roi_box is not None:
-            x, y, w, h = roi_box
-            cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (255, 255, 0), 1)
 
         candidate_box = police_debug.get('candidate_box')
         raw_candidate_box = police_debug.get('raw_candidate_box')
@@ -1621,10 +2131,39 @@ def processing_task():
                 cv2.LINE_AA,
             )
 
+        capture_reason = None
+        candidate_score = float(police_debug.get('score', 0.0))
+        if (
+            police_hard_immediate_dodge
+            or police_collision_imminent
+            or police_detected_now
+            or police_emergency_close
+            or police_obstacle_close
+        ):
+            capture_reason = 'urgent'
+        elif police_debug.get('seen'):
+            capture_reason = 'confirmed'
+        elif raw_candidate_box is not None and candidate_score >= POLICE_DEBUG_CAPTURE_SCORE_MIN:
+            capture_reason = 'candidate'
+        elif police_mode and raw_candidate_box is not None:
+            capture_reason = 'active'
+
+        should_capture = False
         with data_lock:
+            if shared_data['police_debug_capture_cooldown'] > 0:
+                shared_data['police_debug_capture_cooldown'] -= 1
+            if (
+                POLICE_DEBUG_CAPTURE_ENABLED
+                and capture_reason is not None
+                and shared_data['police_debug_capture_cooldown'] <= 0
+            ):
+                shared_data['police_debug_capture_cooldown'] = POLICE_DEBUG_CAPTURE_COOLDOWN_FRAMES
+                should_capture = True
             shared_data['debug_front_frame'] = debug_frame
+        if should_capture:
+            save_police_debug_capture(debug_frame, police_debug, capture_reason)
     else:
-        update_police_state(False, police_score=0.0)
+        update_police_state(False, police_score=0.0, allow_activation=False)
 
 
 def send_controls_task():
@@ -1683,7 +2222,11 @@ def send_controls_task():
 # ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
-    
+    print("Debug keys: T = reset Python timers/state, Q = quit")
+    print("Note: R is reserved for the simulator only. Python will not reset its clock on R.")
+    print("Auto clock reset: if simulator image stops for ~3s, Python returns to WAIT 0.0s.")
+    print(f"Automatic police screenshots from code: {'ON' if POLICE_DEBUG_CAPTURE_ENABLED else 'OFF'}")
+
     # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
@@ -1705,6 +2248,8 @@ if __name__ == '__main__':
     t_processing.start()
     t_controls.start()
     
+    last_runtime_reset_key_time = 0.0
+    
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
@@ -1719,9 +2264,26 @@ if __name__ == '__main__':
             if back is not None:
                 cv2.imshow("Back Camera", cv2.resize(back, (640, 480)))
 
-            if cv2.waitKey(33) & 0xFF == ord('q'):
+            key = cv2.waitKey(33) & 0xFF
+
+            # OpenCV catches keys only when an OpenCV window has focus.
+            # The keyboard module gives a best-effort global R/T reset when the simulator window has focus.
+            try:
+                # Do NOT listen to global R here. R only resets the simulator when
+                # the simulator window has focus. Listening to global R caused
+                # Python timers to reset even when Unity did not restart.
+                global_reset_pressed = keyboard.is_pressed('t')
+            except Exception:
+                global_reset_pressed = False
+
+            if key == ord('q'):
                 is_running = False
                 break
+            elif key == ord('t') or global_reset_pressed:
+                now_key_time = time.monotonic()
+                if now_key_time - last_runtime_reset_key_time > 0.80:
+                    reset_runtime_state('manual hotkey')
+                    last_runtime_reset_key_time = now_key_time
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
