@@ -157,7 +157,14 @@ GOLDEN_LANE_REARM_FRAMES = max(1, int(1.2 / TASK_PERIOD_SECONDS))
 GOLDEN_LANE_DETECT_INTERVAL_FRAMES = 15
 GOLDEN_LANE_TOP = 0
 GOLDEN_LANE_BOTTOM = 90
-GOLDEN_LANE_MATCH_THRESHOLD = 0.34
+# Matching occurs only after yellow-banner and black-text validation, allowing
+# a slightly lower threshold than whole-HUD matching without false triggers.
+GOLDEN_LANE_MATCH_THRESHOLD = 0.27
+GOLDEN_BANNER_MIN_AREA = 450
+GOLDEN_BANNER_MIN_WIDTH = 90
+GOLDEN_YELLOW_LOWER = np.array([16, 70, 90])
+GOLDEN_YELLOW_UPPER = np.array([40, 255, 255])
+GOLDEN_BLACK_UPPER_VALUE = 160
 GOLDEN_LANE_TEMPLATES = None
 LANE_SETTLE_FRAMES = 10
 
@@ -804,16 +811,14 @@ def mark_danger_lanes_from_token_contours(lane_states, contours, color_code, roa
 
 
 def build_golden_lane_templates():
-    """Build small top-bar text templates for LANE 1..5 without OCR deps."""
+    """Build normalized digit glyphs for lanes 1..5 without OCR deps."""
     templates = []
     fonts = [
         cv2.FONT_HERSHEY_SIMPLEX,
         cv2.FONT_HERSHEY_DUPLEX,
     ]
     for shown_lane in range(1, NUM_LANES + 1):
-        # Keep this deliberately small; hundreds of templates made both camera
-        # windows stutter. Matching "LANE X" is enough to recover X.
-        variants = (f"LANE {shown_lane}",)
+        variants = (str(shown_lane),)
         for text in variants:
             for font in fonts:
                 for scale in (0.42, 0.50, 0.58):
@@ -830,18 +835,26 @@ def build_golden_lane_templates():
                         thickness,
                         cv2.LINE_AA,
                     )
-                    edges = cv2.Canny(template, 60, 160)
-                    if cv2.countNonZero(edges) > 0:
+                    points = cv2.findNonZero(template)
+                    if points is not None:
+                        gx, gy, gw, gh = cv2.boundingRect(points)
+                        glyph = template[gy:gy + gh, gx:gx + gw]
+                        glyph = cv2.resize(glyph, (18, 26), interpolation=cv2.INTER_AREA)
+                        _, glyph = cv2.threshold(glyph, 80, 255, cv2.THRESH_BINARY)
                         templates.append({
                             'shown_lane': shown_lane,
-                            'image': edges,
+                            'image': glyph,
                         })
     return templates
 
 
 def detect_golden_lane_event(frame):
     """
-    Detect "LANE X - ALL GREEN!" in the front-camera top bar.
+    OpenCV-only Golden Lane reader.
+
+    1. Find the yellow HUD banner in the top of the image.
+    2. Extract only dark/black lettering inside that yellow rectangle.
+    3. Template-match LANE 1 through LANE 5 against the extracted text.
 
     Timer anchor: detection time, because this script has no simulator event
     timestamp channel for EV5.
@@ -854,20 +867,93 @@ def detect_golden_lane_event(frame):
     if top_bar.size == 0:
         return None, 0.0
 
-    gray = cv2.cvtColor(top_bar, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    edges = cv2.Canny(gray, 60, 160)
+    top_hsv = cv2.cvtColor(top_bar, cv2.COLOR_BGR2HSV)
+    yellow_mask = cv2.inRange(top_hsv, GOLDEN_YELLOW_LOWER, GOLDEN_YELLOW_UPPER)
+    yellow_mask = cv2.morphologyEx(
+        yellow_mask,
+        cv2.MORPH_CLOSE,
+        np.ones((5, 9), np.uint8),
+        iterations=2,
+    )
+    contours, _ = cv2.findContours(
+        yellow_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    banner_box = None
+    banner_score = -1.0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        if area < GOLDEN_BANNER_MIN_AREA or w < GOLDEN_BANNER_MIN_WIDTH or h < 10:
+            continue
+        fill = area / float(max(w * h, 1))
+        score = area * fill
+        if score > banner_score:
+            banner_score = score
+            banner_box = (x, y, w, h)
+
+    # No yellow region means this cannot be the Golden Lane message. This is
+    # the important false-positive guard missing from whole-HUD edge matching.
+    if banner_box is None:
+        return None, 0.0
+
+    x, y, w, h = banner_box
+    pad_x = max(2, int(w * 0.02))
+    pad_y = max(1, int(h * 0.08))
+    x1, x2 = max(0, x + pad_x), min(top_bar.shape[1], x + w - pad_x)
+    y1, y2 = max(0, y + pad_y), min(top_bar.shape[0], y + h - pad_y)
+    banner_hsv = top_hsv[y1:y2, x1:x2]
+    if banner_hsv.size == 0:
+        return None, 0.0
+
+    # Black text may have antialiased grey edge pixels. Hue/saturation are not
+    # useful for black, so extract it by value while remaining inside the
+    # already-confirmed yellow banner rectangle.
+    black_text = cv2.inRange(
+        banner_hsv,
+        np.array([0, 0, 0]),
+        np.array([180, 255, GOLDEN_BLACK_UPPER_VALUE]),
+    )
+    if cv2.countNonZero(black_text) < 18:
+        return None, 0.0
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(black_text, 8)
+    characters = []
+    for component in range(1, component_count):
+        cx, cy, cw, ch, area = stats[component]
+        if area >= 3 and ch >= 6 and cw >= 1:
+            characters.append((cx, cy, cw, ch, area))
+    characters.sort(key=lambda item: item[0])
+
+    # The validated message starts with "LANE X". Font antialiasing can join
+    # neighbouring letters, so find the first word-space rather than assuming
+    # a fixed component number; the component after that gap is X.
+    if len(characters) < 3:
+        return None, 0.0
+    widths = [item[2] for item in characters[:6]]
+    gap_threshold = max(4.0, float(np.median(widths)) * 0.45)
+    digit_component = None
+    for index in range(1, min(len(characters), 7)):
+        previous_right = characters[index - 1][0] + characters[index - 1][2]
+        gap = characters[index][0] - previous_right
+        if gap >= gap_threshold:
+            digit_component = characters[index]
+            break
+    if digit_component is None:
+        return None, 0.0
+    gx, gy, gw, gh, _ = digit_component
+    digit = black_text[gy:gy + gh, gx:gx + gw]
+    digit = cv2.resize(digit, (18, 26), interpolation=cv2.INTER_AREA)
+    _, digit = cv2.threshold(digit, 80, 255, cv2.THRESH_BINARY)
 
     best_lane = None
     best_score = 0.0
     for template in GOLDEN_LANE_TEMPLATES:
         tmpl = template['image']
-        if edges.shape[0] < tmpl.shape[0] or edges.shape[1] < tmpl.shape[1]:
-            continue
-        match = cv2.matchTemplate(edges, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, score, _, _ = cv2.minMaxLoc(match)
+        match = cv2.matchTemplate(digit, tmpl, cv2.TM_CCOEFF_NORMED)
+        score = float(match[0, 0])
         if score > best_score:
-            best_score = float(score)
+            best_score = score
             best_lane = template['shown_lane']
 
     if best_lane is None or best_score < GOLDEN_LANE_MATCH_THRESHOLD:
