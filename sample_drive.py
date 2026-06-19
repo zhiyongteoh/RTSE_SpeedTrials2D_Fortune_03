@@ -34,8 +34,18 @@ shared_data = {
     'debug_front_frame': None,  # Front frame with five-lane token labels
     'steering_input' : 0.0,
     'acceleration_input' : 1.0,
-    'target_lane': 1,        # 0: Left, 1: Middle, 2: Right
-    'current_lane': 1,
+    'target_lane': 2,        # Five-lane index: center is L2.
+    'current_lane': 2,
+    'settled_lane': 2,
+    'lane_arrival_confirmed': True,
+    'lane_settle_timer': 0,
+    'pending_lane': None,
+    'golden_lane_active': False,
+    'golden_lane_target': None,
+    'golden_lane_timer': 0,
+    'golden_rearm_timer': 0,
+    'golden_detect_score': 0.0,
+    'golden_scan_counter': 0,
     'low_brightness': False,  # Event flag
     # NEW: Darkness Improvement
     'front_brightness': 255.0,
@@ -108,6 +118,7 @@ DETECT_ROAD_RIGHT_BOTTOM = 248
 EGO_IGNORE_LEFT = 102
 EGO_IGNORE_RIGHT = 218
 EGO_IGNORE_TOP = 185
+TOKEN_ROI_EDGE_MARGIN = 8
 
 PROXIMITY_SCAN_TOP = 165
 PROXIMITY_SCAN_BOTTOM = 185
@@ -124,20 +135,31 @@ DANGER_CLOSE_BOTTOM_Y = 150
 DANGER_CLOSE_ADJACENT_AREA = 120
 RED_EMERGENCY_TAP_FRAMES = 18
 
-# Token-shape filters. They reject grass bands, lane markings, road shoulder
-# fragments, and the player's own car while still accepting round tokens.
+# Token-shape filters. Tokens are small round blobs in the 320 x 240
+# processing frame; circularity rejects rectangular road art and lane fragments.
 TOKEN_MIN_AREA = 8
-TOKEN_MAX_AREA = 5200
-TOKEN_MAX_DIMENSION = 96
-TOKEN_MIN_ASPECT = 0.35
-TOKEN_MAX_ASPECT = 2.6
-TOKEN_MIN_FILL_RATIO = 0.20
+TOKEN_MAX_AREA = 1800
+TOKEN_MAX_DIMENSION = 64
+TOKEN_MIN_CIRCULARITY = 0.45
+TOKEN_MIN_FILL_RATIO = 0.34
 RIGHT_SHOULDER_REJECT_MARGIN = 18
 
 # ---------------------------------------------------------
 # Police Event Configuration
 # ---------------------------------------------------------
 TASK_PERIOD_SECONDS = 0.033
+
+# Golden Lane EV5: top-bar text says "LANE X - ALL GREEN!" using 1-5.
+# Internal lane labels are L0-L4, so the detector converts X -> X - 1.
+GOLDEN_LANE_EVENT_SECONDS = 5.0
+GOLDEN_LANE_EVENT_FRAMES = max(1, int(GOLDEN_LANE_EVENT_SECONDS / TASK_PERIOD_SECONDS))
+GOLDEN_LANE_REARM_FRAMES = max(1, int(1.2 / TASK_PERIOD_SECONDS))
+GOLDEN_LANE_DETECT_INTERVAL_FRAMES = 15
+GOLDEN_LANE_TOP = 0
+GOLDEN_LANE_BOTTOM = 90
+GOLDEN_LANE_MATCH_THRESHOLD = 0.34
+GOLDEN_LANE_TEMPLATES = None
+LANE_SETTLE_FRAMES = 10
 
 # ---------------------------------------------------------
 # Game Day Race Clock Configuration
@@ -241,12 +263,12 @@ DARKNESS_DROP_TARGET_THRESHOLD = 50.0
 
 CRITICAL_DARKNESS_THRESHOLD = 38.0
 
-DARKNESS_ACCELERATION = 0.35
-CRITICAL_DARKNESS_ACCELERATION = 0.15
+DARKNESS_ACCELERATION = 0.55
+CRITICAL_DARKNESS_ACCELERATION = 0.35
 LIGHT_TOGGLE_ACCELERATION = -1.0
-LIGHT_TOGGLE_FRAMES = 8
-DARKNESS_RETRY_SIGNAL_FRAMES = 4
-DARKNESS_RETRY_COOLDOWN_FRAMES = 24
+LIGHT_TOGGLE_FRAMES = 2
+DARKNESS_RETRY_SIGNAL_FRAMES = 1
+DARKNESS_RETRY_COOLDOWN_FRAMES = 90
 NORMAL_TAP_FRAMES = 16          # Stronger steering duration for token avoidance
 DARKNESS_TAP_FRAMES = 14        # Longer dodge in darkness, but not too long
 TRAILING_TAP_FRAMES = 34        # Chasing car needs a longer lane-change hold
@@ -293,6 +315,14 @@ CHASE_APPROACH_BOTTOM_GAIN = 3
 CHASE_MAX_CENTER_JUMP = 80
 CHASE_MEMORY_LOST_FRAMES = 6
 CHASE_KERNEL = np.ones((5, 5), np.uint8)
+
+# Acceleration floors chosen by the frame arbiter. Emergency modes need enough
+# forward motion for lateral steering authority, even if Darkness is active.
+NORMAL_ACCELERATION = 1.0
+RED_YELLOW_DODGE_ACCELERATION = 0.72
+POLICE_DODGE_ACCELERATION = 0.62
+POLICE_COLLISION_ACCELERATION = 0.30
+POLICE_RED_COLLECTION_ACCELERATION = 0.68
 
 # Improve token detection in dark scenes.
 DARK_KERNEL = np.ones((3, 3), np.uint8)
@@ -513,72 +543,225 @@ def detection_edges_at_y(pixel_y):
     return left, right
 
 
-def is_token_like_contour(contour, color_code=None):
-    """Reject road art, lane lines, grass bands, and the player's own car."""
+def back_road_edges_at_y(pixel_y):
+    """Return back-camera road edges for shared object gating."""
+    pixel_y = float(np.clip(pixel_y, BACK_ROAD_TOP_Y, BACK_ROAD_BOTTOM_Y))
+    scale = (pixel_y - BACK_ROAD_TOP_Y) / float(BACK_ROAD_BOTTOM_Y - BACK_ROAD_TOP_Y)
+    left = BACK_ROAD_LEFT_TOP + (BACK_ROAD_LEFT_BOTTOM - BACK_ROAD_LEFT_TOP) * scale
+    right = BACK_ROAD_RIGHT_TOP + (BACK_ROAD_RIGHT_BOTTOM - BACK_ROAD_RIGHT_TOP) * scale
+    return left, right
+
+
+def token_contour_metrics(contour):
+    """Return contour metrics used for circular token filtering and overlay."""
     area = cv2.contourArea(contour)
-    if area < TOKEN_MIN_AREA or area > TOKEN_MAX_AREA:
-        return False
-
+    perimeter = cv2.arcLength(contour, True)
     x, y, w, h = cv2.boundingRect(contour)
-    if max(w, h) > TOKEN_MAX_DIMENSION:
+    (_, _), radius = cv2.minEnclosingCircle(contour)
+    circularity = 0.0
+    if perimeter > 0:
+        circularity = float((4.0 * np.pi * area) / (perimeter * perimeter))
+    fill_ratio = area / float(max(w * h, 1))
+
+    M = cv2.moments(contour)
+    if M['m00'] > 0:
+        center_x = int(M['m10'] / M['m00'])
+        center_y = int(M['m01'] / M['m00'])
+    else:
+        center_x = x + (w // 2)
+        center_y = y + (h // 2)
+
+    return {
+        'area': area,
+        'perimeter': perimeter,
+        'circularity': circularity,
+        'fill_ratio': fill_ratio,
+        'x': x,
+        'y': y,
+        'w': w,
+        'h': h,
+        'cx': center_x,
+        'cy': center_y,
+        'bottom': y + h,
+        'radius': radius,
+    }
+
+
+def object_gate_reason(
+    metrics,
+    road_mask=None,
+    edge_func=detection_edges_at_y,
+    edge_margin=TOKEN_ROI_EDGE_MARGIN,
+    shape_kind='round',
+    min_area=TOKEN_MIN_AREA,
+    max_area=TOKEN_MAX_AREA,
+):
+    """
+    Shared road/shape gate for real objects.
+
+    Keeping this centralized prevents kerb, edge, and off-road fragments from
+    being accepted differently by tokens vs. chasing-car detection.
+    """
+    center_x = metrics['cx']
+    center_y = metrics['cy']
+
+    if road_mask is not None:
+        if center_y < 0 or center_y >= road_mask.shape[0] or center_x < 0 or center_x >= road_mask.shape[1]:
+            return 'outside-road'
+        if road_mask[int(center_y), int(center_x)] == 0:
+            return 'outside-road'
+
+    left_edge, right_edge = edge_func(center_y)
+    if center_x < left_edge + edge_margin or center_x > right_edge - edge_margin:
+        return 'edge'
+
+    if metrics['area'] < min_area or metrics['area'] > max_area:
+        return 'size'
+
+    if max(metrics['w'], metrics['h']) > TOKEN_MAX_DIMENSION and shape_kind == 'round':
+        return 'size'
+
+    thin_ratio = min(metrics['w'], metrics['h']) / float(max(metrics['w'], metrics['h'], 1))
+    if thin_ratio < 0.18:
+        return 'too-thin'
+
+    if shape_kind == 'round':
+        if metrics['circularity'] < TOKEN_MIN_CIRCULARITY or metrics['fill_ratio'] < TOKEN_MIN_FILL_RATIO:
+            return 'not-round'
+    elif shape_kind == 'wide-car':
+        aspect_ratio = metrics['w'] / float(max(metrics['h'], 1))
+        if aspect_ratio < CHASE_MIN_ASPECT or aspect_ratio > CHASE_MAX_ASPECT:
+            return 'bad-shape'
+        if metrics['fill_ratio'] < CHASE_MIN_FILL_RATIO:
+            return 'too-thin'
+
+    return None
+
+
+def is_circular_token_shape(contour, min_area=TOKEN_MIN_AREA, max_area=TOKEN_MAX_AREA):
+    """Accept compact round token blobs; reject elongated or rectangular shapes."""
+    metrics = token_contour_metrics(contour)
+    return object_gate_reason(
+        metrics,
+        road_mask=None,
+        edge_func=lambda _y: (-9999, 9999),
+        edge_margin=0,
+        shape_kind='round',
+        min_area=min_area,
+        max_area=max_area,
+    ) is None
+
+
+def is_centroid_inside_token_road_roi(center_x, center_y, road_mask=None):
+    """Keep token centroids on asphalt, away from shoulder/grass ROI edges."""
+    if center_y < DETECT_ROAD_TOP_Y or center_y > DETECT_ROAD_BOTTOM_Y:
         return False
 
-    aspect_ratio = w / float(max(h, 1))
-    fill_ratio = area / float(max(w * h, 1))
+    left_edge, right_edge = detection_edges_at_y(center_y)
     if (
-        aspect_ratio < TOKEN_MIN_ASPECT
-        or aspect_ratio > TOKEN_MAX_ASPECT
-        or fill_ratio < TOKEN_MIN_FILL_RATIO
+        center_x < left_edge + TOKEN_ROI_EDGE_MARGIN
+        or center_x > right_edge - TOKEN_ROI_EDGE_MARGIN
     ):
         return False
 
-    center_x = x + (w // 2)
-    bottom_y = y + h
-
-    if bottom_y >= EGO_IGNORE_TOP and EGO_IGNORE_LEFT <= center_x <= EGO_IGNORE_RIGHT:
-        return False
-
-    # The red-white right road shoulder often breaks into compact red blobs.
-    # Reject red detections hugging the detection boundary in the lower half.
-    if color_code == 'R':
-        _, right_edge = detection_edges_at_y(bottom_y)
-        if bottom_y > 120 and center_x > right_edge - RIGHT_SHOULDER_REJECT_MARGIN:
+    if road_mask is not None:
+        y = int(np.clip(center_y, 0, road_mask.shape[0] - 1))
+        x = int(np.clip(center_x, 0, road_mask.shape[1] - 1))
+        if road_mask[y, x] == 0:
             return False
 
     return True
 
 
-def collect_token_observations(contours, color_code, max_area=None, max_dimension=None):
+def token_rejection_reason(contour, color_code=None, road_mask=None):
+    metrics = token_contour_metrics(contour)
+    reason = object_gate_reason(
+        metrics,
+        road_mask=road_mask,
+        edge_func=detection_edges_at_y,
+        edge_margin=TOKEN_ROI_EDGE_MARGIN,
+        shape_kind='round',
+    )
+    if reason is not None:
+        return reason
+
+    if metrics['bottom'] >= EGO_IGNORE_TOP and EGO_IGNORE_LEFT <= metrics['cx'] <= EGO_IGNORE_RIGHT:
+        return 'ego-car'
+
+    if color_code == 'R':
+        _, right_edge = detection_edges_at_y(metrics['bottom'])
+        if metrics['bottom'] > 120 and metrics['cx'] > right_edge - RIGHT_SHOULDER_REJECT_MARGIN:
+            return 'kerb'
+
+    return None
+
+
+def is_token_like_contour(contour, color_code=None, road_mask=None):
+    """Reject road art, lane lines, grass bands, and the player's own car."""
+    return token_rejection_reason(contour, color_code, road_mask) is None
+
+
+def collect_token_observations(contours, color_code, road_mask=None, max_area=None, max_dimension=None):
     """Convert contours into compact token records used only by the overlay."""
     observations = []
 
     for contour in contours:
-        if not is_token_like_contour(contour, color_code):
+        if not is_token_like_contour(contour, color_code, road_mask):
             continue
 
-        area = cv2.contourArea(contour)
-
-        x, y, w, h = cv2.boundingRect(contour)
+        metrics = token_contour_metrics(contour)
+        area = metrics['area']
+        x = metrics['x']
+        y = metrics['y']
+        w = metrics['w']
+        h = metrics['h']
         if max_area is not None and area > max_area:
             continue
         if max_dimension is not None and max(w, h) > max_dimension:
             continue
 
-        center_x = x + w // 2
-        bottom_y = y + h
+        center_x = metrics['cx']
+        center_y = metrics['cy']
+        bottom_y = metrics['bottom']
         observations.append({
             'color': color_code,
             'x': x,
             'y': y,
             'w': w,
             'h': h,
+            'cx': center_x,
+            'cy': center_y,
+            'radius': max(3, int(round(metrics['radius']))),
+            'confidence': min(1.0, max(0.0, metrics['circularity'])),
             'lane': pixel_x_to_debug_lane(center_x, bottom_y),
         })
 
     return observations
 
 
-def mark_danger_lanes_from_token_contours(lane_states, contours, color_code):
+def classify_token_contours(contours, color_code, road_mask=None, max_rejected=8):
+    """Return accepted contours plus low-cost rejected samples for debug labels."""
+    accepted = []
+    rejected = []
+
+    for contour in contours:
+        metrics = token_contour_metrics(contour)
+        reason = token_rejection_reason(contour, color_code, road_mask)
+        if reason is None:
+            accepted.append(contour)
+        elif len(rejected) < max_rejected and metrics['area'] >= TOKEN_MIN_AREA:
+            rejected.append({
+                'color': color_code,
+                'reason': reason,
+                'cx': metrics['cx'],
+                'cy': metrics['cy'],
+                'radius': max(3, int(round(metrics['radius']))),
+            })
+
+    return accepted, rejected
+
+
+def mark_danger_lanes_from_token_contours(lane_states, contours, color_code, road_mask=None):
     """
     Mark lanes as dangerous from a wider red/yellow look-ahead zone.
 
@@ -588,7 +771,7 @@ def mark_danger_lanes_from_token_contours(lane_states, contours, color_code):
     danger_lanes = set()
 
     for contour in contours:
-        if not is_token_like_contour(contour, color_code):
+        if not is_token_like_contour(contour, color_code, road_mask):
             continue
 
         area = cv2.contourArea(contour)
@@ -618,6 +801,124 @@ def mark_danger_lanes_from_token_contours(lane_states, contours, color_code):
                 danger_lanes.add(lane + 1)
 
     return danger_lanes
+
+
+def build_golden_lane_templates():
+    """Build small top-bar text templates for LANE 1..5 without OCR deps."""
+    templates = []
+    fonts = [
+        cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.FONT_HERSHEY_DUPLEX,
+    ]
+    for shown_lane in range(1, NUM_LANES + 1):
+        # Keep this deliberately small; hundreds of templates made both camera
+        # windows stutter. Matching "LANE X" is enough to recover X.
+        variants = (f"LANE {shown_lane}",)
+        for text in variants:
+            for font in fonts:
+                for scale in (0.42, 0.50, 0.58):
+                    thickness = 1
+                    (w, h), baseline = cv2.getTextSize(text, font, scale, thickness)
+                    template = np.zeros((h + baseline + 10, w + 10), dtype=np.uint8)
+                    cv2.putText(
+                        template,
+                        text,
+                        (5, h + 3),
+                        font,
+                        scale,
+                        255,
+                        thickness,
+                        cv2.LINE_AA,
+                    )
+                    edges = cv2.Canny(template, 60, 160)
+                    if cv2.countNonZero(edges) > 0:
+                        templates.append({
+                            'shown_lane': shown_lane,
+                            'image': edges,
+                        })
+    return templates
+
+
+def detect_golden_lane_event(frame):
+    """
+    Detect "LANE X - ALL GREEN!" in the front-camera top bar.
+
+    Timer anchor: detection time, because this script has no simulator event
+    timestamp channel for EV5.
+    """
+    global GOLDEN_LANE_TEMPLATES
+    if GOLDEN_LANE_TEMPLATES is None:
+        GOLDEN_LANE_TEMPLATES = build_golden_lane_templates()
+
+    top_bar = frame[GOLDEN_LANE_TOP:GOLDEN_LANE_BOTTOM, :]
+    if top_bar.size == 0:
+        return None, 0.0
+
+    gray = cv2.cvtColor(top_bar, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    edges = cv2.Canny(gray, 60, 160)
+
+    best_lane = None
+    best_score = 0.0
+    for template in GOLDEN_LANE_TEMPLATES:
+        tmpl = template['image']
+        if edges.shape[0] < tmpl.shape[0] or edges.shape[1] < tmpl.shape[1]:
+            continue
+        match = cv2.matchTemplate(edges, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(match)
+        if score > best_score:
+            best_score = float(score)
+            best_lane = template['shown_lane']
+
+    if best_lane is None or best_score < GOLDEN_LANE_MATCH_THRESHOLD:
+        return None, best_score
+
+    # In-game text is 1-based ("LANE 4"); internal/HUD lanes are L0-L4.
+    internal_lane_index = int(best_lane) - 1
+    return int(np.clip(internal_lane_index, 0, NUM_LANES - 1)), best_score
+
+
+def update_golden_lane_state(small_frame):
+    """Latch EV5 for 5s without extending the timer while the banner persists."""
+    with data_lock:
+        if shared_data.get('golden_rearm_timer', 0) > 0:
+            shared_data['golden_rearm_timer'] -= 1
+
+        if shared_data.get('golden_lane_active') and shared_data.get('golden_lane_timer', 0) > 0:
+            shared_data['golden_lane_timer'] -= 1
+            if shared_data['golden_lane_timer'] <= 0:
+                shared_data['golden_lane_active'] = False
+                shared_data['golden_lane_target'] = None
+                shared_data['golden_rearm_timer'] = GOLDEN_LANE_REARM_FRAMES
+            return
+
+        shared_data['golden_scan_counter'] = (
+            shared_data.get('golden_scan_counter', 0) + 1
+        ) % GOLDEN_LANE_DETECT_INTERVAL_FRAMES
+        should_scan = shared_data['golden_scan_counter'] == 0
+
+    if not should_scan:
+        return
+
+    detected_lane, detect_score = detect_golden_lane_event(small_frame)
+    with data_lock:
+        shared_data['golden_detect_score'] = detect_score
+        if detected_lane is None or shared_data.get('golden_rearm_timer', 0) > 0:
+            return
+
+        shared_data['golden_lane_active'] = True
+        shared_data['golden_lane_target'] = detected_lane
+        shared_data['golden_lane_timer'] = GOLDEN_LANE_EVENT_FRAMES
+        shared_data['target_lane'] = detected_lane
+        shared_data['pending_lane'] = detected_lane
+        shared_data['lane_arrival_confirmed'] = False
+        shared_data['lane_settle_timer'] = LANE_SETTLE_FRAMES
+
+    print(
+        "Golden Lane detected: "
+        f"target=L{detected_lane}, score={detect_score:.2f}, "
+        f"timer={GOLDEN_LANE_EVENT_SECONDS:.1f}s"
+    )
 
 
 # ---------------------------------------------------------
@@ -885,8 +1186,18 @@ def update_race_clock_from_frame(small_frame):
             shared_data.update({
                 'steering_input': 0.0,
                 'acceleration_input': 1.0,
-                'target_lane': 1,
-                'current_lane': 1,
+                'target_lane': NUM_LANES // 2,
+                'current_lane': NUM_LANES // 2,
+                'settled_lane': NUM_LANES // 2,
+                'lane_arrival_confirmed': True,
+                'lane_settle_timer': 0,
+                'pending_lane': None,
+                'golden_lane_active': False,
+                'golden_lane_target': None,
+                'golden_lane_timer': 0,
+                'golden_rearm_timer': 0,
+                'golden_detect_score': 0.0,
+                'golden_scan_counter': 0,
                 'low_brightness': False,
                 'front_brightness': 255.0,
                 'last_front_brightness': 255.0,
@@ -928,6 +1239,8 @@ def update_race_clock_from_frame(small_frame):
                 'chasing_prev_bottom_y': 0,
                 'chasing_prev_center_x': None,
                 'chasing_lost_frames': 0,
+                'debug_front_frame': None,
+                'debug_back_frame': None,
             })
 
         shared_data['race_prev_motion_frame'] = current_motion_frame
@@ -961,8 +1274,18 @@ def reset_runtime_state(reason='manual'):
             # Control state
             'steering_input': 0.0,
             'acceleration_input': 1.0,
-            'target_lane': 1,
-            'current_lane': 1,
+            'target_lane': NUM_LANES // 2,
+            'current_lane': NUM_LANES // 2,
+            'settled_lane': NUM_LANES // 2,
+            'lane_arrival_confirmed': True,
+            'lane_settle_timer': 0,
+            'pending_lane': None,
+            'golden_lane_active': False,
+            'golden_lane_target': None,
+            'golden_lane_timer': 0,
+            'golden_rearm_timer': 0,
+            'golden_detect_score': 0.0,
+            'golden_scan_counter': 0,
 
             # Darkness / light state
             'low_brightness': False,
@@ -1004,6 +1327,16 @@ def reset_runtime_state(reason='manual'):
             'trailing_escape_cooldown': 0,
             'trailing_escape_send_timer': 0,
             'trailing_debug_tick': 0,
+            'chasing_car_seen': False,
+            'chasing_car_score': 0.0,
+            'chasing_car_box': None,
+            'chasing_car_reason': 'NONE',
+            'chasing_prev_area': 0.0,
+            'chasing_prev_bottom_y': 0,
+            'chasing_prev_center_x': None,
+            'chasing_lost_frames': 0,
+            'debug_front_frame': None,
+            'debug_back_frame': None,
 
             # 180s Game Day race clock state
             'race_elapsed': 0.0,
@@ -1607,10 +1940,17 @@ def detect_back_chasing_car(back_frame):
     )
 
     best = None
+    rejected_candidates = []
 
     for contour in contours:
+        metrics = token_contour_metrics(contour)
         contour_area = cv2.contourArea(contour)
         if contour_area < 80:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': cv2.boundingRect(contour),
+                    'reason': 'size',
+                })
             continue
 
         x, y, w, h = cv2.boundingRect(contour)
@@ -1618,11 +1958,38 @@ def detect_back_chasing_car(back_frame):
         center_x = x + (w // 2)
         box_area = w * h
 
+        gate_reason = object_gate_reason(
+            metrics,
+            road_mask=roi_mask,
+            edge_func=back_road_edges_at_y,
+            edge_margin=8,
+            shape_kind='wide-car',
+            min_area=80,
+            max_area=12000,
+        )
+        if gate_reason is not None:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': gate_reason,
+                })
+            continue
+
         if w < CHASE_MIN_WIDTH or h < CHASE_MIN_HEIGHT:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'size',
+                })
             continue
 
         # Far tiny blobs are usually tokens/signs/background.
         if bottom_y < 88:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'far',
+                })
             continue
 
         aspect_ratio = w / float(max(h, 1))
@@ -1630,12 +1997,27 @@ def detect_back_chasing_car(back_frame):
 
         # Reject round token-like objects and thin road/sign fragments.
         if aspect_ratio < CHASE_MIN_ASPECT or aspect_ratio > CHASE_MAX_ASPECT:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'bad-shape',
+                })
             continue
         if fill_ratio < CHASE_MIN_FILL_RATIO:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'too-thin',
+                })
             continue
 
         # Chasing car should appear around the centre road corridor.
         if abs(center_x - 160) > CHASE_CENTER_TOLERANCE:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'edge',
+                })
             continue
 
         x1 = max(0, x - 10)
@@ -1648,6 +2030,11 @@ def detect_back_chasing_car(back_frame):
         dark_pixels = cv2.countNonZero(dark_mask[y1:y2, x1:x2])
 
         if cyan_pixels < CHASE_MIN_CYAN_PIXELS:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'color',
+                })
             continue
 
         has_car_support = (
@@ -1656,6 +2043,11 @@ def detect_back_chasing_car(back_frame):
             or (cyan_pixels >= CHASE_MIN_CYAN_PIXELS * 2 and w >= CHASE_MIN_WIDTH + 18)
         )
         if not has_car_support:
+            if len(rejected_candidates) < 6:
+                rejected_candidates.append({
+                    'box': (x, y, w, h),
+                    'reason': 'no-support',
+                })
             continue
 
         center_error = abs(center_x - 160)
@@ -1743,9 +2135,9 @@ def detect_back_chasing_car(back_frame):
 
         strong_candidate = best['score'] >= CHASE_MIN_SCORE
 
-        if strong_candidate and (approaching or already_close):
+        if strong_candidate and approaching:
             seen = True
-            reason = 'APPROACHING' if approaching else 'CLOSE'
+            reason = 'CLOSE_APPROACH' if already_close else 'APPROACHING'
 
         with data_lock:
             shared_data['chasing_prev_area'] = best['area']
@@ -1783,6 +2175,20 @@ def detect_back_chasing_car(back_frame):
             1,
             cv2.LINE_AA,
         )
+
+    for rejected in rejected_candidates:
+        x, y, w, h = rejected['box']
+        cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (80, 80, 255), 1)
+        cv2.putText(
+            debug_frame,
+            rejected['reason'],
+            (x, max(10, y - 3)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.28,
+            (80, 80, 255),
+            1,
+            cv2.LINE_AA,
+        )
     else:
         with data_lock:
             shared_data['chasing_lost_frames'] += 1
@@ -1814,18 +2220,148 @@ def detect_back_chasing_car(back_frame):
         'already_close': already_close,
         'area_gain': area_gain,
         'bottom_gain': bottom_gain,
+        'rejected_candidates': rejected_candidates,
         'debug_frame': debug_frame,
     }
 
     return seen, debug_info
 
+
+def choose_frame_action(
+    action_kind,
+    steering_target,
+    low_brightness,
+    critical_darkness,
+    back_steering_escape=0.0,
+):
+    """
+    Single per-frame control arbiter.
+
+    Steering taps live here so emergency priorities can override cooldowns
+    instead of being blocked by stale lower-priority lane-following state.
+    """
+    with data_lock:
+        light_pulse_active = shared_data['light_signal_timer'] > 0
+        if light_pulse_active:
+            shared_data['light_signal_timer'] -= 1
+
+        if shared_data.get('lane_settle_timer', 0) > 0:
+            shared_data['lane_settle_timer'] -= 1
+            if shared_data['lane_settle_timer'] == 0 and shared_data.get('pending_lane') is not None:
+                # Separate from current_lane because current_lane is still an
+                # optimistic/intended lane used by existing cooldown logic.
+                shared_data['settled_lane'] = int(shared_data['pending_lane'])
+                shared_data['lane_arrival_confirmed'] = True
+                shared_data['pending_lane'] = None
+
+        emergency_action = action_kind in {
+            'police',
+            'police_collision',
+            'police_red',
+            'red_yellow',
+            'chasing',
+            'golden',
+        }
+
+        if emergency_action:
+            shared_data['tap_timer'] = 0
+            shared_data['cooldown_timer'] = 0
+            shared_data['tap_steering'] = steering_target
+
+            if action_kind == 'chasing':
+                steering = back_steering_escape
+                acceleration = TRAILING_ESCAPE_ACCELERATION
+                shared_data['trailing_detect_count'] = 0
+                shared_data['trailing_escape_cooldown'] = TRAILING_ESCAPE_COOLDOWN_FRAMES
+                lane_delta = -1 if back_steering_escape < 0 else 1
+                next_lane = shared_data.get('current_lane', NUM_LANES // 2) + lane_delta
+                shared_data['target_lane'] = int(np.clip(next_lane, 0, NUM_LANES - 1))
+                shared_data['pending_lane'] = shared_data['target_lane']
+                shared_data['lane_arrival_confirmed'] = False
+                shared_data['lane_settle_timer'] = LANE_SETTLE_FRAMES
+                shared_data['current_lane'] = shared_data['target_lane']
+            else:
+                steering = steering_target
+                if action_kind == 'police_collision':
+                    acceleration = POLICE_COLLISION_ACCELERATION
+                elif action_kind == 'police':
+                    acceleration = POLICE_DODGE_ACCELERATION
+                elif action_kind == 'police_red':
+                    acceleration = POLICE_RED_COLLECTION_ACCELERATION
+                elif action_kind == 'golden':
+                    acceleration = NORMAL_ACCELERATION
+                    if shared_data.get('golden_lane_target') is not None:
+                        golden_target = int(shared_data['golden_lane_target'])
+                        shared_data['target_lane'] = golden_target
+                        if shared_data.get('pending_lane') != golden_target:
+                            shared_data['pending_lane'] = golden_target
+                            shared_data['lane_arrival_confirmed'] = False
+                            shared_data['lane_settle_timer'] = LANE_SETTLE_FRAMES
+                else:
+                    acceleration = RED_YELLOW_DODGE_ACCELERATION
+
+            # Emergency acceleration floors outrank Darkness and light pulse.
+            reason = action_kind
+
+        else:
+            if shared_data['tap_timer'] > 0:
+                shared_data['tap_timer'] -= 1
+                steering = shared_data['tap_steering']
+                if shared_data['tap_timer'] == 0:
+                    shared_data['cooldown_timer'] = (
+                        DARKNESS_COOLDOWN_FRAMES
+                        if shared_data['low_brightness']
+                        else NORMAL_COOLDOWN_FRAMES
+                    )
+                reason = 'normal-tap'
+            elif shared_data['cooldown_timer'] > 0:
+                shared_data['cooldown_timer'] -= 1
+                steering = 0.0
+                reason = 'normal-cooldown'
+            elif steering_target != 0.0:
+                shared_data['tap_steering'] = steering_target
+                shared_data['tap_timer'] = (
+                    DARKNESS_TAP_FRAMES
+                    if shared_data['low_brightness']
+                    else NORMAL_TAP_FRAMES
+                )
+                steering = steering_target
+                reason = 'green-or-lane'
+            else:
+                steering = 0.0
+                reason = 'normal'
+
+            if light_pulse_active:
+                # Light pulse is acceleration-only; it must not erase steering.
+                acceleration = LIGHT_TOGGLE_ACCELERATION
+                reason = f"{reason}+light"
+            elif low_brightness:
+                acceleration = (
+                    CRITICAL_DARKNESS_ACCELERATION
+                    if critical_darkness
+                    else DARKNESS_ACCELERATION
+                )
+                reason = f"{reason}+dark"
+            else:
+                acceleration = NORMAL_ACCELERATION
+
+        shared_data['steering_input'] = float(steering)
+        shared_data['acceleration_input'] = float(acceleration)
+
+    return {
+        'steering': float(steering),
+        'acceleration': float(acceleration),
+        'reason': reason,
+    }
+
 def processing_task():
     with data_lock:
         front_frame = shared_data['latest_front_frame']
         back_frame = shared_data['latest_back_frame']
-        police_mode = shared_data['police_active']
+    police_mode = shared_data['police_active']
     
     steering_target = 0.0
+    action_kind = 'normal'
     frame_center = 160
     
     # ---------------------------------------------------------
@@ -1878,7 +2414,11 @@ def processing_task():
             evade_back_car = True
 
             with data_lock:
-                current_lane_for_escape = shared_data.get('current_lane', 1)
+                current_lane_for_escape = (
+                    shared_data.get('settled_lane', NUM_LANES // 2)
+                    if shared_data.get('lane_arrival_confirmed', False)
+                    else shared_data.get('current_lane', NUM_LANES // 2)
+                )
 
             back_steering_escape = choose_trailing_escape_direction(
                 current_lane_for_escape,
@@ -1900,6 +2440,10 @@ def processing_task():
     if front_frame is not None:
         small_frame = cv2.resize(front_frame, (320, 240))
         game_state, race_elapsed, race_phase = update_race_clock_from_frame(small_frame)
+        update_golden_lane_state(small_frame)
+        with data_lock:
+            golden_lane_active = shared_data.get('golden_lane_active', False)
+            golden_lane_target = shared_data.get('golden_lane_target')
         
         # ---------------------------------------------------------
         # NEW: Darkness Improvement
@@ -1946,8 +2490,9 @@ def processing_task():
                                   
         mask_yellow = cv2.inRange(hsv_frame, lower_yellow, upper_yellow)
 
-        # Grey helper mask: useful for visual checks after a yellow effect or
-        # during low brightness. Compact filtering below rejects large road areas.
+        # Grey/white boulder hazards can be circular too. Keep them in their
+        # own mask and never feed them into token contours; tokens must pass
+        # both circularity and green/red/yellow HSV color membership.
         lower_grey = np.array([0, 0, 80])
         upper_grey = np.array([180, 48, 205])
         mask_grey = cv2.inRange(hsv_frame, lower_grey, upper_grey)
@@ -1998,16 +2543,38 @@ def processing_task():
             mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, DARK_KERNEL)
             mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, DARK_KERNEL)
         
+        contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filtered_red_contours = [
-            contour for contour in contours_red
-            if is_token_like_contour(contour, 'R')
-        ]
-        filtered_yellow_contours = [
-            contour for contour in contours_yellow
-            if is_token_like_contour(contour, 'Y')
-        ]
+        filtered_green_contours, rejected_green_tokens = classify_token_contours(
+            contours_green,
+            'G',
+            road_mask,
+        )
+        filtered_red_contours, rejected_red_tokens = classify_token_contours(
+            contours_red,
+            'R',
+            road_mask,
+        )
+        filtered_yellow_contours, rejected_yellow_tokens = classify_token_contours(
+            contours_yellow,
+            'Y',
+            road_mask,
+        )
+        rejected_token_observations = (
+            rejected_green_tokens + rejected_red_tokens + rejected_yellow_tokens
+        )
+        token_observations = (
+            collect_token_observations(filtered_green_contours, 'G', road_mask)
+            + collect_token_observations(filtered_red_contours, 'R', road_mask)
+            + collect_token_observations(filtered_yellow_contours, 'Y', road_mask)
+        )
+        nearest_token_observation = None
+        if token_observations:
+            nearest_token_observation = max(
+                token_observations,
+                key=lambda item: (item['cy'], item['y'] + item['h']),
+            )
 
         # ---------------------------------------------------------
         # FIXED: Proximity Scan Line - 5 Bucket Bounding Boxes
@@ -2042,9 +2609,9 @@ def processing_task():
                 # Find local contours within this lane segment slice to verify shape integrity
                 sub_contours, _ = cv2.findContours(green_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 for sc in sub_contours:
-                    sc_area = cv2.contourArea(sc)
-                    # Legitimate tokens at this perspective scale have structured footprint areas
-                    if 6 <= sc_area <= 450:
+                    # Legitimate tokens in the scan slice are compact circles,
+                    # not rectangular grass/road fragments.
+                    if is_circular_token_shape(sc, min_area=6, max_area=450):
                         valid_green = True
                         break
 
@@ -2054,7 +2621,7 @@ def processing_task():
                 combined_danger_mask = cv2.bitwise_or(red_roi, yellow_roi)
                 sub_contours_d, _ = cv2.findContours(combined_danger_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 for sc in sub_contours_d:
-                    if 6 <= cv2.contourArea(sc) <= 450:
+                    if is_circular_token_shape(sc, min_area=6, max_area=450):
                         valid_danger = True
                         break
             
@@ -2071,11 +2638,13 @@ def processing_task():
             lane_states,
             filtered_red_contours,
             'R',
+            road_mask,
         )
         danger_lanes_from_yellow = mark_danger_lanes_from_token_contours(
             lane_states,
             filtered_yellow_contours,
             'Y',
+            road_mask,
         )
         danger_lanes_from_tokens = danger_lanes_from_red | danger_lanes_from_yellow
 
@@ -2216,49 +2785,41 @@ def processing_task():
             )
         ):
             steering_target = back_steering_escape
+            action_kind = 'chasing'
             print(f"Trailing Car Alert! Escaping to steering: {steering_target}")
         elif police_hard_immediate_dodge:
             # Absolute priority: police is already close/low in the front camera.
             # Bypass red-token chasing and normal cooldown immediately.
             steering_target = police_escape_steering
             police_urgent_avoidance = True
-            with data_lock:
-                shared_data['police_avoid_timer'] = POLICE_HARD_DODGE_HOLD_FRAMES
-                shared_data['police_avoid_steering'] = steering_target
-                shared_data['police_avoid_acceleration'] = POLICE_HARD_DODGE_ACCELERATION
+            action_kind = 'police'
             print(f"HARD Police Dodge NOW! Steering: {steering_target}")
         elif police_collision_imminent:
             # Priority 1: Do not hit the police car head-on
             steering_target = police_escape_steering
             police_urgent_avoidance = True
-            with data_lock:
-                shared_data['police_avoid_timer'] = POLICE_COLLISION_AVOID_HOLD_FRAMES
-                shared_data['police_avoid_steering'] = steering_target
-                shared_data['police_avoid_acceleration'] = POLICE_COLLISION_BRAKE_ACCELERATION
+            action_kind = 'police_collision'
             print(f"Collision Imminent! Full police dodge: {steering_target}")
         elif police_detected_now:
             # Priority 2: The moment a police candidate is detected in the
             # driving corridor, evade immediately without extra delay.
             steering_target = police_escape_steering
             police_urgent_avoidance = True
-            with data_lock:
-                shared_data['police_avoid_acceleration'] = POLICE_AVOID_ACCELERATION
+            action_kind = 'police'
             print(f"Instant Police Avoidance! Steering: {steering_target}")
         elif police_sudden_risk:
             # Priority 3: Crest/visibility-change protection. If a strong
             # police-like obstacle suddenly appears ahead, evade immediately.
             steering_target = police_escape_steering
             police_urgent_avoidance = True
-            with data_lock:
-                shared_data['police_avoid_acceleration'] = POLICE_AVOID_ACCELERATION
+            action_kind = 'police'
             print(f"Sudden Police Risk! Steering: {steering_target}")
         elif police_emergency_close:
             # Priority 4: Even before the police event fully confirms, treat a
             # strong close police candidate as an obstacle to avoid game over.
             steering_target = police_escape_steering
             police_urgent_avoidance = True
-            with data_lock:
-                shared_data['police_avoid_acceleration'] = POLICE_AVOID_ACCELERATION
+            action_kind = 'police'
             print(f"Emergency Police Avoidance! Steering: {steering_target}")
             
         elif police_mode:
@@ -2269,8 +2830,7 @@ def processing_task():
             if police_obstacle_close:
                 steering_target = police_escape_steering
                 police_urgent_avoidance = True
-                with data_lock:
-                    shared_data['police_avoid_acceleration'] = POLICE_AVOID_ACCELERATION
+                action_kind = 'police'
                 print(f"Police Car Close! Evading to steering: {steering_target}")
             else:
                 with data_lock:
@@ -2288,6 +2848,7 @@ def processing_task():
                         error = red_target['cx'] - frame_center
                         steering_target = -1.0 if error < -12 else (1.0 if error > 12 else 0.0)
                         police_red_chase_active = True
+                        action_kind = 'police_red'
                         print(
                             "Police Red Chase! "
                             f"cx={red_target['cx']}, err={error}, "
@@ -2307,6 +2868,16 @@ def processing_task():
                 else:
                     steering_target = 0.0
 
+        elif golden_lane_active and golden_lane_target is not None:
+            action_kind = 'golden'
+            ego_lane = NUM_LANES // 2
+            if golden_lane_target < ego_lane:
+                steering_target = -1.0
+            elif golden_lane_target > ego_lane:
+                steering_target = 1.0
+            else:
+                steering_target = 0.0
+
         else:
             # Priority 3: Standard Navigation using the 5-Bucket Logic Engine
             ego_lane = 2  # The camera is fixed to the car, so the car is always in lane 2
@@ -2315,6 +2886,7 @@ def processing_task():
             
             if current_state == 'Danger':
                 red_emergency_avoidance = True
+                action_kind = 'red_yellow'
                 # Need to escape. Find nearest Target or Clear lane
                 min_dist = float('inf')
                 for priority in ['Target', 'Clear']:
@@ -2354,93 +2926,13 @@ def processing_task():
                 steering_target = 1.0
                 print(f"Logic Engine: Steering RIGHT to Lane {best_lane}")
 
-        # Commit decision to shared resources safely using a Tap Sequence [cite: 152]
-        with data_lock:
-            if (
-                police_alert_active
-                and police_escape_steering != 0.0
-                and shared_data['tap_timer'] > 0
-                and np.sign(shared_data['tap_steering']) != np.sign(police_escape_steering)
-            ):
-                # Cancel an old token-avoidance tap if it would steer us into
-                # the police car.
-                shared_data['tap_timer'] = 0
-                shared_data['cooldown_timer'] = 0
-                shared_data['tap_steering'] = 0.0
-                shared_data['steering_input'] = 0.0
-
-            if evade_back_car and not police_urgent_avoidance:
-                shared_data['tap_steering'] = back_steering_escape
-                shared_data['tap_timer'] = TRAILING_TAP_FRAMES
-                shared_data['cooldown_timer'] = 0
-                shared_data['steering_input'] = back_steering_escape
-                shared_data['trailing_detect_count'] = 0
-                shared_data['trailing_escape_cooldown'] = TRAILING_ESCAPE_COOLDOWN_FRAMES
-                shared_data['trailing_escape_send_timer'] = TRAILING_TAP_FRAMES
-                lane_delta = -1 if back_steering_escape < 0 else 1
-                shared_data['target_lane'] = int(np.clip(shared_data.get('current_lane', 1) + lane_delta, 0, 2))
-                shared_data['current_lane'] = shared_data['target_lane']
-                print(
-                    "Initiating Trailing Escape! "
-                    f"Steering: {back_steering_escape}, lane={shared_data['current_lane']}"
-                )
-            elif police_urgent_avoidance and steering_target != 0.0:
-                # Police avoidance must bypass the normal tap/cooldown rhythm.
-                if shared_data['police_avoid_timer'] <= 0:
-                    shared_data['police_avoid_timer'] = POLICE_AVOID_HOLD_FRAMES
-                    shared_data['police_avoid_acceleration'] = POLICE_AVOID_ACCELERATION
-                shared_data['police_avoid_steering'] = steering_target
-                shared_data['tap_timer'] = 0
-                shared_data['cooldown_timer'] = 0
-                shared_data['tap_steering'] = steering_target
-                shared_data['steering_input'] = steering_target
-            elif shared_data['police_avoid_timer'] > 0:
-                shared_data['police_avoid_timer'] -= 1
-                shared_data['steering_input'] = shared_data['police_avoid_steering']
-            elif police_red_chase_active and steering_target != 0.0:
-                shared_data['tap_steering'] = steering_target
-                shared_data['tap_timer'] = max(8, NORMAL_TAP_FRAMES // 2)
-                shared_data['cooldown_timer'] = 0
-                shared_data['steering_input'] = steering_target
-                print(f"Initiating Police Red Chase Tap! Steering: {steering_target}")
-            elif red_emergency_avoidance and steering_target != 0.0:
-                # Red/yellow in the current lane has priority over the normal
-                # tap/cooldown rhythm. Otherwise the car often reaches the token
-                # before the next tap is allowed.
-                shared_data['tap_steering'] = steering_target
-                shared_data['tap_timer'] = RED_EMERGENCY_TAP_FRAMES
-                shared_data['cooldown_timer'] = 0
-                shared_data['steering_input'] = steering_target
-                print(f"Emergency Red/Yellow Avoid Tap! Steering: {steering_target}")
-            elif shared_data['tap_timer'] > 0:
-                # State 1: Actively tapping [cite: 156]
-                shared_data['tap_timer'] -= 1
-                shared_data['steering_input'] = shared_data['tap_steering']
-                if shared_data['tap_timer'] == 0:
-                    # NEW: Darkness Improvement
-                    # Wait slightly longer during darkness to reduce random left-right movement.
-                    if shared_data['low_brightness']:
-                        shared_data['cooldown_timer'] = DARKNESS_COOLDOWN_FRAMES
-                    else:
-                        shared_data['cooldown_timer'] = NORMAL_COOLDOWN_FRAMES
-                    shared_data['steering_input'] = 0.0
-            elif shared_data['cooldown_timer'] > 0:
-                # State 2: Waiting for car to settle [cite: 157]
-                shared_data['cooldown_timer'] -= 1
-                shared_data['steering_input'] = 0.0
-            else:
-                # State 0: Ready for a new tap [cite: 154]
-                if steering_target != 0.0:
-                    shared_data['tap_steering'] = steering_target
-                    # NEW: Darkness Improvement - use shorter steering taps in darkness.
-                    if shared_data['low_brightness']:
-                        shared_data['tap_timer'] = DARKNESS_TAP_FRAMES
-                    else:
-                        shared_data['tap_timer'] = NORMAL_TAP_FRAMES
-                    shared_data['steering_input'] = steering_target
-                    print(f"Initiating Tap! Steering: {steering_target}")
-                else:
-                    shared_data['steering_input'] = 0.0
+        arbiter_action = choose_frame_action(
+            action_kind,
+            steering_target,
+            low_brightness,
+            critical_darkness,
+            back_steering_escape=back_steering_escape,
+        )
 
         # ---------------------------------------------------------
         # Front-camera debug frame: white five-lane guides plus token labels.
@@ -2522,6 +3014,56 @@ def processing_task():
                 cv2.LINE_AA,
             )
 
+        car_debug_point = (frame_center, ROAD_BOTTOM_Y - 8)
+        token_debug_colors = {
+            'G': (0, 255, 0),
+            'R': (0, 0, 255),
+            'Y': (0, 255, 255),
+        }
+        for rejected in rejected_token_observations[:10]:
+            rejected_center = (int(rejected['cx']), int(rejected['cy']))
+            cv2.circle(
+                debug_frame,
+                rejected_center,
+                int(rejected['radius']),
+                (120, 120, 120),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                debug_frame,
+                rejected['reason'],
+                (rejected_center[0] + 3, max(8, rejected_center[1] - 3)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.26,
+                (120, 120, 120),
+                1,
+                cv2.LINE_AA,
+            )
+        if nearest_token_observation is not None:
+            token_color = token_debug_colors.get(nearest_token_observation['color'], (0, 255, 0))
+            token_center = (
+                int(nearest_token_observation['cx']),
+                int(nearest_token_observation['cy']),
+            )
+            token_radius = int(nearest_token_observation['radius'])
+            cv2.line(
+                debug_frame,
+                car_debug_point,
+                token_center,
+                token_color,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.circle(
+                debug_frame,
+                token_center,
+                token_radius,
+                token_color,
+                2,
+                cv2.LINE_AA,
+            )
+
         with data_lock:
             overlay_game_state = shared_data['race_game_state']
             overlay_race_elapsed = shared_data['race_elapsed']
@@ -2536,6 +3078,14 @@ def processing_task():
                 'SIGNAL'
                 if shared_data['light_signal_timer'] > 0
                 else ('ON' if shared_data['lights_on'] else 'OFF')
+            )
+            overlay_golden_active = shared_data.get('golden_lane_active', False)
+            overlay_golden_target = shared_data.get('golden_lane_target')
+            overlay_golden_timer = shared_data.get('golden_lane_timer', 0) * TASK_PERIOD_SECONDS
+            overlay_golden_score = shared_data.get('golden_detect_score', 0.0)
+            overlay_golden_positioned = (
+                shared_data.get('lane_arrival_confirmed', False)
+                and shared_data.get('settled_lane') == overlay_golden_target
             )
 
         overlay_font_scale = 0.30
@@ -2589,6 +3139,38 @@ def processing_task():
                 f"timer={overlay_police_timer:.1f}s"
             ),
             (5, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            overlay_font_scale,
+            overlay_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            debug_frame,
+            (
+                f"golden={'ON' if overlay_golden_active else 'OFF'} "
+                f"target={overlay_golden_target} "
+                f"left={overlay_golden_timer:.1f}s "
+                f"pos={'Y' if overlay_golden_positioned else 'N'} "
+                f"score={overlay_golden_score:.2f}"
+            ),
+            (5, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            overlay_font_scale,
+            overlay_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            debug_frame,
+            (
+                f"action={arbiter_action['reason']} | "
+                f"steer={arbiter_action['steering']:.1f} "
+                f"accel={arbiter_action['acceleration']:.2f}"
+            ),
+            (5, 72),
             cv2.FONT_HERSHEY_SIMPLEX,
             overlay_font_scale,
             overlay_color,
@@ -2681,34 +3263,7 @@ def send_controls_task():
 
     with data_lock:
         steering_to_send = shared_data['steering_input']
-        police_avoid_active = shared_data['police_avoid_timer'] > 0
-        police_avoid_acceleration = shared_data['police_avoid_acceleration']
-        trailing_escape_active = shared_data['trailing_escape_send_timer'] > 0
-
-        # EV1 Darkness light/brake pulse is only a short pulse.
-        if shared_data['light_signal_timer'] > 0:
-            shared_data['light_signal_timer'] -= 1
-            steering_to_send = 0.0
-            acceleration_to_send = LIGHT_TOGGLE_ACCELERATION
-
-        # EV3/EV4 chasing escape must override darkness slow speed.
-        # If we keep acceleration at 0.15/0.35, the car cannot complete the lane change.
-        elif trailing_escape_active:
-            shared_data['trailing_escape_send_timer'] -= 1
-            steering_to_send = shared_data['tap_steering']
-            acceleration_to_send = TRAILING_ESCAPE_ACCELERATION
-
-        elif police_avoid_active:
-            acceleration_to_send = police_avoid_acceleration
-
-        elif shared_data['low_brightness']:
-            if shared_data['front_brightness'] < CRITICAL_DARKNESS_THRESHOLD:
-                acceleration_to_send = CRITICAL_DARKNESS_ACCELERATION
-            else:
-                acceleration_to_send = DARKNESS_ACCELERATION
-
-        else:
-            acceleration_to_send = 1.0
+        acceleration_to_send = shared_data['acceleration_input']
 
     try:
         data = struct.pack('ff', steering_to_send, acceleration_to_send)
