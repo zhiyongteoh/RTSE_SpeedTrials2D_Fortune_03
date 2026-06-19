@@ -22,6 +22,15 @@ CONTROL_PORT = 8081
 shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
+    'debug_back_frame': None,
+    'chasing_car_seen': False,
+    'chasing_car_score': 0.0,
+    'chasing_car_box': None,
+    'chasing_car_reason': 'NONE',
+    'chasing_prev_area': 0.0,
+    'chasing_prev_bottom_y': 0,
+    'chasing_prev_center_x': None,
+    'chasing_lost_frames': 0,
     'debug_front_frame': None,  # Front frame with five-lane token labels
     'steering_input' : 0.0,
     'acceleration_input' : 1.0,
@@ -31,6 +40,10 @@ shared_data = {
     # NEW: Darkness Improvement
     'front_brightness': 255.0,
     'last_front_brightness': 255.0,
+    'front_road_brightness': 255.0,
+    'front_center_brightness': 255.0,
+    'front_darkness_metric': 255.0,
+    'light_retry_cooldown': 0,
     'darkness_enter_count': 0,
     'darkness_exit_count': 0,
     'lights_on': False,
@@ -99,6 +112,17 @@ EGO_IGNORE_TOP = 185
 PROXIMITY_SCAN_TOP = 165
 PROXIMITY_SCAN_BOTTOM = 185
 PROXIMITY_PIXEL_THRESHOLD = 15
+
+# Extra red/yellow look-ahead detection.
+# The original scan line only checks a thin band at y=165..185, so fast red
+# tokens can be detected too late. This wider zone marks dangerous lanes earlier.
+DANGER_LOOKAHEAD_TOP = 105
+DANGER_LOOKAHEAD_BOTTOM = 212
+DANGER_LOOKAHEAD_MIN_AREA = 7
+DANGER_LOOKAHEAD_MAX_AREA = 3600
+DANGER_CLOSE_BOTTOM_Y = 150
+DANGER_CLOSE_ADJACENT_AREA = 120
+RED_EMERGENCY_TAP_FRAMES = 18
 
 # Token-shape filters. They reject grass bands, lane markings, road shoulder
 # fragments, and the player's own car while still accepting round tokens.
@@ -204,28 +228,71 @@ POLICE_KERNEL = np.ones((5, 5), np.uint8)
 # NEW: Darkness Improvement Configuration
 # ---------------------------------------------------------
 # Enter/exit Darkness Mode only after several frames so it does not flicker.
-DARKNESS_ENTER_THRESHOLD = 42.0
-DARKNESS_ENTER_FRAMES = 2
-DARKNESS_EXIT_THRESHOLD = 58.0
-DARKNESS_EXIT_FRAMES = 10
-DARKNESS_EMERGENCY_THRESHOLD = 24.0
-DARKNESS_DROP_THRESHOLD = 16.0
-DARKNESS_DROP_TARGET_THRESHOLD = 35.0
+# Use an effective road brightness metric, not only whole-screen mean.
+# This catches very fast EV1 darkness drops even when UI/text/tokens keep
+# the whole-frame average artificially high.
+DARKNESS_ENTER_THRESHOLD = 48.0
+DARKNESS_ENTER_FRAMES = 1
+DARKNESS_EXIT_THRESHOLD = 62.0
+DARKNESS_EXIT_FRAMES = 12
+DARKNESS_EMERGENCY_THRESHOLD = 34.0
+DARKNESS_DROP_THRESHOLD = 12.0
+DARKNESS_DROP_TARGET_THRESHOLD = 50.0
 
-CRITICAL_DARKNESS_THRESHOLD = 35.0
+CRITICAL_DARKNESS_THRESHOLD = 38.0
 
 DARKNESS_ACCELERATION = 0.35
 CRITICAL_DARKNESS_ACCELERATION = 0.15
 LIGHT_TOGGLE_ACCELERATION = -1.0
-LIGHT_TOGGLE_FRAMES = 6
-NORMAL_TAP_FRAMES = 14          # Increased: Stronger steering duration
-DARKNESS_TAP_FRAMES = 11        # Increased: Longer dodge in darkness
-TRAILING_TAP_FRAMES = 24
-TRAILING_CONFIRM_FRAMES = 1
-TRAILING_ESCAPE_COOLDOWN_FRAMES = 45
-NORMAL_COOLDOWN_FRAMES = 8      # Reduced: Faster recovery for repeated dodges
-DARKNESS_COOLDOWN_FRAMES = 12
+LIGHT_TOGGLE_FRAMES = 8
+DARKNESS_RETRY_SIGNAL_FRAMES = 4
+DARKNESS_RETRY_COOLDOWN_FRAMES = 24
+NORMAL_TAP_FRAMES = 16          # Stronger steering duration for token avoidance
+DARKNESS_TAP_FRAMES = 14        # Longer dodge in darkness, but not too long
+TRAILING_TAP_FRAMES = 34        # Chasing car needs a longer lane-change hold
+TRAILING_CONFIRM_FRAMES = 2
+TRAILING_ESCAPE_COOLDOWN_FRAMES = 38
+TRAILING_ESCAPE_ACCELERATION = 0.95  # Do not use darkness slow speed during chasing escape
+NORMAL_COOLDOWN_FRAMES = 5      # Faster recovery for repeated red-token dodges
+DARKNESS_COOLDOWN_FRAMES = 8
 TRAILING_DEBUG_VERSION = "trailing-v5-state"
+
+# ---------------------------------------------------------
+# Back Camera Chasing Car Detection
+# Detects the cyan/turquoise chasing car from rear camera.
+# ---------------------------------------------------------
+TRAILING_DEBUG_VERSION = "chasing-cyan-v2-approach"
+
+# Use a tighter central road ROI for the back camera.
+# This avoids side signs, lamp posts, and off-road objects.
+BACK_ROAD_TOP_Y = 76
+BACK_ROAD_BOTTOM_Y = 239
+BACK_ROAD_LEFT_TOP = 126
+BACK_ROAD_RIGHT_TOP = 194
+BACK_ROAD_LEFT_BOTTOM = 34
+BACK_ROAD_RIGHT_BOTTOM = 286
+
+# Car-shape and color thresholds.
+CHASE_MIN_CYAN_PIXELS = 120
+CHASE_MIN_BLUE_PIXELS = 6
+CHASE_MIN_DARK_PIXELS = 22
+CHASE_MIN_SCORE = 850.0
+CHASE_CLOSE_SCORE = 980.0
+CHASE_CLOSE_BOTTOM_Y = 138
+CHASE_CLOSE_AREA = 950
+CHASE_MIN_WIDTH = 36
+CHASE_MIN_HEIGHT = 14
+CHASE_MIN_ASPECT = 1.35
+CHASE_MAX_ASPECT = 5.8
+CHASE_MIN_FILL_RATIO = 0.16
+CHASE_CENTER_TOLERANCE = 82
+
+# Temporal validation: the chasing car should become larger or move lower.
+CHASE_APPROACH_AREA_GAIN = 1.08
+CHASE_APPROACH_BOTTOM_GAIN = 3
+CHASE_MAX_CENTER_JUMP = 80
+CHASE_MEMORY_LOST_FRAMES = 6
+CHASE_KERNEL = np.ones((5, 5), np.uint8)
 
 # Improve token detection in dark scenes.
 DARK_KERNEL = np.ones((3, 3), np.uint8)
@@ -511,32 +578,129 @@ def collect_token_observations(contours, color_code, max_area=None, max_dimensio
     return observations
 
 
+def mark_danger_lanes_from_token_contours(lane_states, contours, color_code):
+    """
+    Mark lanes as dangerous from a wider red/yellow look-ahead zone.
+
+    This fixes the case where the car only notices a red token at the thin
+    proximity scan line and reaches it before the lane change finishes.
+    """
+    danger_lanes = set()
+
+    for contour in contours:
+        if not is_token_like_contour(contour, color_code):
+            continue
+
+        area = cv2.contourArea(contour)
+        if area < DANGER_LOOKAHEAD_MIN_AREA or area > DANGER_LOOKAHEAD_MAX_AREA:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        center_x = x + (w // 2)
+        bottom_y = y + h
+
+        if bottom_y < DANGER_LOOKAHEAD_TOP or bottom_y > DANGER_LOOKAHEAD_BOTTOM:
+            continue
+
+        lane = pixel_x_to_debug_lane(center_x, bottom_y)
+        lane_states[lane] = 'Danger'
+        danger_lanes.add(lane)
+
+        # If the red/yellow token is already very close and reasonably large,
+        # also mark the neighbouring lane as not preferred. This prevents the
+        # controller from changing only half a lane and still clipping the token.
+        if bottom_y >= DANGER_CLOSE_BOTTOM_Y and area >= DANGER_CLOSE_ADJACENT_AREA:
+            if lane > 0:
+                lane_states[lane - 1] = 'Danger'
+                danger_lanes.add(lane - 1)
+            if lane < NUM_LANES - 1:
+                lane_states[lane + 1] = 'Danger'
+                danger_lanes.add(lane + 1)
+
+    return danger_lanes
+
+
 # ---------------------------------------------------------
 # NEW: Darkness Improvement Helper Functions
 # ---------------------------------------------------------
 def set_vehicle_light(is_on, brightness):
     """
     Track the vehicle light state when Darkness Mode changes and schedule the
-    Unity-recognized light command. The game logs show that acceleration -1.0
-    during darkness restores the lights.
+    Unity-recognized light command. The command is a short -1.0 pulse only,
+    not continuous reverse acceleration.
     """
     if shared_data['lights_on'] == is_on:
         return
 
     shared_data['lights_on'] = is_on
     if is_on:
-        shared_data['light_signal_timer'] = LIGHT_TOGGLE_FRAMES
+        shared_data['light_signal_timer'] = max(
+            shared_data['light_signal_timer'],
+            LIGHT_TOGGLE_FRAMES,
+        )
+        shared_data['light_retry_cooldown'] = DARKNESS_RETRY_COOLDOWN_FRAMES
+    else:
+        shared_data['light_retry_cooldown'] = 0
+
     light_state = "ON" if is_on else "OFF"
     print(f"Vehicle Light {light_state} | brightness={brightness:.1f}")
 
 
-def update_darkness_state(brightness):
+def estimate_front_darkness_metric(small_frame):
+    """
+    Return robust brightness values for EV1 Darkness.
+
+    Whole-frame mean is unreliable because HUD text, sky, tokens, and lane
+    lines can stay bright while the road view suddenly becomes dark. For
+    Darkness, the most useful signal is the road/center ROI brightness.
+    """
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+    scene_mean = float(np.mean(gray))
+
+    roi_mask = np.zeros((240, 320), dtype=np.uint8)
+    brightness_top_y = DETECT_ROAD_TOP_Y
+    brightness_bottom_y = min(178, DETECT_ROAD_BOTTOM_Y)
+    left_top, right_top = detection_edges_at_y(brightness_top_y)
+    left_bottom, right_bottom = detection_edges_at_y(brightness_bottom_y)
+    brightness_polygon = np.array([
+        [int(left_bottom), brightness_bottom_y],
+        [int(right_bottom), brightness_bottom_y],
+        [int(right_top), brightness_top_y],
+        [int(left_top), brightness_top_y],
+    ], dtype=np.int32)
+    cv2.fillPoly(roi_mask, [brightness_polygon], 255)
+
+    road_pixels = gray[roi_mask > 0]
+    if road_pixels.size == 0:
+        road_mean = scene_mean
+        road_p25 = scene_mean
+    else:
+        road_mean = float(np.mean(road_pixels))
+        road_p25 = float(np.percentile(road_pixels, 25))
+
+    center_roi = gray[96:178, 118:202]
+    center_mean = float(np.mean(center_roi)) if center_roi.size else scene_mean
+
+    # Use the darkest stable region as the state signal, but avoid using only
+    # percentile because lane markings can create very low isolated pixels.
+    darkness_metric = min(scene_mean, road_mean, center_mean)
+
+    return {
+        'scene_mean': scene_mean,
+        'road_mean': road_mean,
+        'road_p25': road_p25,
+        'center_mean': center_mean,
+        'metric': darkness_metric,
+    }
+
+
+def update_darkness_state(brightness, brightness_info=None):
     """
     Detect EV1 Darkness reliably.
 
-    Fix: when the camera brightness suddenly drops from around 35+ to 10+,
-    do not wait for several frames. Enter Darkness Mode immediately and keep
-    sending acceleration_input = -1.0 for enough frames for Unity to open light.
+    Uses an effective road brightness metric so sudden fast darkness drops do
+    not get hidden by bright HUD/text/tokens. Sends a short light/brake pulse
+    on entry, then optional short retry pulses if the scene is still very dark.
     """
     with data_lock:
         previous_brightness = float(shared_data.get('front_brightness', brightness))
@@ -545,6 +709,15 @@ def update_darkness_state(brightness):
 
         shared_data['last_front_brightness'] = previous_brightness
         shared_data['front_brightness'] = brightness
+        shared_data['front_darkness_metric'] = brightness
+
+        if brightness_info is not None:
+            shared_data['front_road_brightness'] = float(
+                brightness_info.get('road_mean', brightness)
+            )
+            shared_data['front_center_brightness'] = float(
+                brightness_info.get('center_mean', brightness)
+            )
 
         instant_darkness = (
             brightness <= DARKNESS_EMERGENCY_THRESHOLD
@@ -569,20 +742,33 @@ def update_darkness_state(brightness):
                 shared_data['low_brightness'] = True
                 shared_data['darkness_enter_count'] = 0
                 set_vehicle_light(True, brightness)
-                shared_data['light_signal_timer'] = max(
-                    shared_data['light_signal_timer'],
-                    LIGHT_TOGGLE_FRAMES
-                )
                 print(
-                    f"Darkness Mode ON | brightness={brightness:.1f} | "
-                    f"prev={previous_brightness:.1f} | drop={brightness_drop:.1f}"
+                    f"Darkness Mode ON | metric={brightness:.1f} | "
+                    f"prev={previous_brightness:.1f} | drop={brightness_drop:.1f} | "
+                    f"road={shared_data['front_road_brightness']:.1f} | "
+                    f"center={shared_data['front_center_brightness']:.1f}"
                 )
         else:
             shared_data['darkness_enter_count'] = 0
 
-            # Do not keep resetting light_signal_timer while it is dark.
-            # If we reset it every frame, acceleration_input stays -1.0 forever
-            # and the car will reverse.
+            # Do not reset light_signal_timer every frame. That caused
+            # acceleration_input=-1.0 forever. Instead, use one short entry
+            # pulse, then occasional short retry pulses only if still critical.
+            if brightness <= CRITICAL_DARKNESS_THRESHOLD:
+                if shared_data['light_signal_timer'] <= 0:
+                    if shared_data['light_retry_cooldown'] > 0:
+                        shared_data['light_retry_cooldown'] -= 1
+                    else:
+                        shared_data['light_signal_timer'] = max(
+                            shared_data['light_signal_timer'],
+                            DARKNESS_RETRY_SIGNAL_FRAMES,
+                        )
+                        shared_data['light_retry_cooldown'] = DARKNESS_RETRY_COOLDOWN_FRAMES
+                        print(
+                            f"Darkness light retry pulse | metric={brightness:.1f}"
+                        )
+            else:
+                shared_data['light_retry_cooldown'] = DARKNESS_RETRY_COOLDOWN_FRAMES
 
             if brightness > DARKNESS_EXIT_THRESHOLD:
                 shared_data['darkness_exit_count'] += 1
@@ -594,7 +780,7 @@ def update_darkness_state(brightness):
                 shared_data['darkness_exit_count'] = 0
                 shared_data['light_signal_timer'] = 0
                 set_vehicle_light(False, brightness)
-                print(f"Darkness Mode OFF | brightness={brightness:.1f}")
+                print(f"Darkness Mode OFF | metric={brightness:.1f}")
 
         return shared_data['low_brightness']
 
@@ -703,6 +889,11 @@ def update_race_clock_from_frame(small_frame):
                 'current_lane': 1,
                 'low_brightness': False,
                 'front_brightness': 255.0,
+                'last_front_brightness': 255.0,
+                'front_road_brightness': 255.0,
+                'front_center_brightness': 255.0,
+                'front_darkness_metric': 255.0,
+                'light_retry_cooldown': 0,
                 'darkness_enter_count': 0,
                 'darkness_exit_count': 0,
                 'lights_on': False,
@@ -729,6 +920,14 @@ def update_race_clock_from_frame(small_frame):
                 'trailing_escape_cooldown': 0,
                 'trailing_escape_send_timer': 0,
                 'trailing_debug_tick': 0,
+                'chasing_car_seen': False,
+                'chasing_car_score': 0.0,
+                'chasing_car_box': None,
+                'chasing_car_reason': 'NONE',
+                'chasing_prev_area': 0.0,
+                'chasing_prev_bottom_y': 0,
+                'chasing_prev_center_x': None,
+                'chasing_lost_frames': 0,
             })
 
         shared_data['race_prev_motion_frame'] = current_motion_frame
@@ -768,6 +967,11 @@ def reset_runtime_state(reason='manual'):
             # Darkness / light state
             'low_brightness': False,
             'front_brightness': 255.0,
+            'last_front_brightness': 255.0,
+            'front_road_brightness': 255.0,
+            'front_center_brightness': 255.0,
+            'front_darkness_metric': 255.0,
+            'light_retry_cooldown': 0,
             'darkness_enter_count': 0,
             'darkness_exit_count': 0,
             'lights_on': False,
@@ -875,8 +1079,20 @@ def evaluate_trailing_signal(
     return False, 'NONE'
 
 
-def choose_trailing_escape_direction(current_lane):
-    """Choose one lane-change direction for a confirmed rear-car event."""
+def choose_trailing_escape_direction(current_lane, chase_center_x=None):
+    """
+    Choose escape direction when chasing car appears behind.
+
+    If the chasing car is more on the right side of the back camera,
+    steer left. If it is more on the left side, steer right.
+    """
+    if chase_center_x is not None:
+        if chase_center_x > 172:
+            return -1.0
+        if chase_center_x < 148:
+            return 1.0
+
+    # Fallback if chasing car is directly centered.
     if current_lane >= 2:
         return -1.0
     return 1.0
@@ -1327,6 +1543,282 @@ def update_police_state(police_seen, police_score=0.0, red_token_captured=False,
 
         return shared_data['police_active']
 
+def detect_back_chasing_car(back_frame):
+    """
+    Detect EV3 / EV4 chasing car from the back camera.
+
+    Important:
+    This detector should NOT fire for every cyan/blue object.
+    It requires:
+    1. cyan/turquoise car body,
+    2. blue headlights or dark windshield/grille support,
+    3. wide car-like bounding box,
+    4. central back-road ROI,
+    5. temporal approaching behaviour.
+    """
+    small_back = cv2.resize(back_frame, (320, 240))
+    hsv = cv2.cvtColor(small_back, cv2.COLOR_BGR2HSV)
+    debug_frame = small_back.copy()
+
+    roi_mask = np.zeros((240, 320), dtype=np.uint8)
+    back_road_polygon = np.array([
+        [BACK_ROAD_LEFT_BOTTOM, BACK_ROAD_BOTTOM_Y],
+        [BACK_ROAD_RIGHT_BOTTOM, BACK_ROAD_BOTTOM_Y],
+        [BACK_ROAD_RIGHT_TOP, BACK_ROAD_TOP_Y],
+        [BACK_ROAD_LEFT_TOP, BACK_ROAD_TOP_Y],
+    ], dtype=np.int32)
+    cv2.fillPoly(roi_mask, [back_road_polygon], 255)
+
+    # Cyan / turquoise body of the chasing car.
+    # Kept narrower than before so green tokens and background objects are rejected.
+    cyan_mask = cv2.inRange(
+        hsv,
+        np.array([76, 55, 55]),
+        np.array([104, 255, 255])
+    )
+
+    # Blue headlights.
+    blue_mask = cv2.inRange(
+        hsv,
+        np.array([104, 85, 70]),
+        np.array([136, 255, 255])
+    )
+
+    # Dark windshield / grille support.
+    dark_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, 0]),
+        np.array([180, 255, 82])
+    )
+
+    cyan_mask = cv2.bitwise_and(cyan_mask, roi_mask)
+    blue_mask = cv2.bitwise_and(blue_mask, roi_mask)
+    dark_mask = cv2.bitwise_and(dark_mask, roi_mask)
+
+    candidate_mask = cv2.bitwise_or(cyan_mask, blue_mask)
+    candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_CLOSE, CHASE_KERNEL)
+    candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, CHASE_KERNEL)
+    candidate_mask = cv2.dilate(candidate_mask, CHASE_KERNEL, iterations=1)
+
+    contours, _ = cv2.findContours(
+        candidate_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best = None
+
+    for contour in contours:
+        contour_area = cv2.contourArea(contour)
+        if contour_area < 80:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        bottom_y = y + h
+        center_x = x + (w // 2)
+        box_area = w * h
+
+        if w < CHASE_MIN_WIDTH or h < CHASE_MIN_HEIGHT:
+            continue
+
+        # Far tiny blobs are usually tokens/signs/background.
+        if bottom_y < 88:
+            continue
+
+        aspect_ratio = w / float(max(h, 1))
+        fill_ratio = contour_area / float(max(box_area, 1))
+
+        # Reject round token-like objects and thin road/sign fragments.
+        if aspect_ratio < CHASE_MIN_ASPECT or aspect_ratio > CHASE_MAX_ASPECT:
+            continue
+        if fill_ratio < CHASE_MIN_FILL_RATIO:
+            continue
+
+        # Chasing car should appear around the centre road corridor.
+        if abs(center_x - 160) > CHASE_CENTER_TOLERANCE:
+            continue
+
+        x1 = max(0, x - 10)
+        y1 = max(0, y - 10)
+        x2 = min(320, x + w + 10)
+        y2 = min(240, y + h + 10)
+
+        cyan_pixels = cv2.countNonZero(cyan_mask[y1:y2, x1:x2])
+        blue_pixels = cv2.countNonZero(blue_mask[y1:y2, x1:x2])
+        dark_pixels = cv2.countNonZero(dark_mask[y1:y2, x1:x2])
+
+        if cyan_pixels < CHASE_MIN_CYAN_PIXELS:
+            continue
+
+        has_car_support = (
+            blue_pixels >= CHASE_MIN_BLUE_PIXELS
+            or dark_pixels >= CHASE_MIN_DARK_PIXELS
+            or (cyan_pixels >= CHASE_MIN_CYAN_PIXELS * 2 and w >= CHASE_MIN_WIDTH + 18)
+        )
+        if not has_car_support:
+            continue
+
+        center_error = abs(center_x - 160)
+
+        score = (
+            cyan_pixels * 2.05
+            + blue_pixels * 2.20
+            + dark_pixels * 0.18
+            + bottom_y * 3.80
+            + w * 4.20
+            + h * 2.10
+            + aspect_ratio * 45.0
+            + fill_ratio * 120.0
+            - center_error * 1.15
+        )
+
+        if blue_pixels >= CHASE_MIN_BLUE_PIXELS:
+            score += 130.0
+        if dark_pixels >= CHASE_MIN_DARK_PIXELS:
+            score += 70.0
+        if bottom_y >= CHASE_CLOSE_BOTTOM_Y:
+            score += 120.0
+
+        item = {
+            'box': (x1, y1, x2 - x1, y2 - y1),
+            'raw_box': (x, y, w, h),
+            'center_x': center_x,
+            'bottom_y': bottom_y,
+            'area': float(box_area),
+            'contour_area': float(contour_area),
+            'aspect_ratio': aspect_ratio,
+            'fill_ratio': fill_ratio,
+            'cyan_pixels': cyan_pixels,
+            'blue_pixels': blue_pixels,
+            'dark_pixels': dark_pixels,
+            'score': score,
+        }
+
+        if best is None or item['score'] > best['score']:
+            best = item
+
+    cv2.polylines(debug_frame, [back_road_polygon], True, (255, 255, 255), 1)
+
+    seen = False
+    approaching = False
+    already_close = False
+    reason = 'NONE'
+    previous_area = 0.0
+    previous_bottom_y = 0
+    previous_center_x = None
+    area_gain = 0.0
+    bottom_gain = 0
+
+    if best is not None:
+        with data_lock:
+            previous_area = float(shared_data.get('chasing_prev_area', 0.0))
+            previous_bottom_y = int(shared_data.get('chasing_prev_bottom_y', 0))
+            previous_center_x = shared_data.get('chasing_prev_center_x')
+
+        if previous_area > 0.0:
+            area_gain = best['area'] / max(previous_area, 1.0)
+        bottom_gain = int(best['bottom_y'] - previous_bottom_y)
+
+        center_stable = (
+            previous_center_x is None
+            or abs(best['center_x'] - int(previous_center_x)) <= CHASE_MAX_CENTER_JUMP
+        )
+
+        # Real chasing car should become bigger or move downward in the back view.
+        approaching = (
+            center_stable
+            and previous_area > 0.0
+            and (
+                area_gain >= CHASE_APPROACH_AREA_GAIN
+                or bottom_gain >= CHASE_APPROACH_BOTTOM_GAIN
+            )
+        )
+
+        # Backup: if it is already large/close, do not wait too long.
+        already_close = (
+            best['bottom_y'] >= CHASE_CLOSE_BOTTOM_Y
+            and best['area'] >= CHASE_CLOSE_AREA
+            and best['score'] >= CHASE_CLOSE_SCORE
+        )
+
+        strong_candidate = best['score'] >= CHASE_MIN_SCORE
+
+        if strong_candidate and (approaching or already_close):
+            seen = True
+            reason = 'APPROACHING' if approaching else 'CLOSE'
+
+        with data_lock:
+            shared_data['chasing_prev_area'] = best['area']
+            shared_data['chasing_prev_bottom_y'] = best['bottom_y']
+            shared_data['chasing_prev_center_x'] = best['center_x']
+            shared_data['chasing_lost_frames'] = 0
+
+        x, y, w, h = best['box']
+        color = (0, 255, 255) if seen else (0, 165, 255)
+        cv2.rectangle(debug_frame, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(
+            debug_frame,
+            (
+                f"chase={reason} score={best['score']:.0f} "
+                f"area={best['area']:.0f} bottom={best['bottom_y']}"
+            ),
+            (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            debug_frame,
+            (
+                f"approach={approaching} close={already_close} "
+                f"gain={area_gain:.2f} dy={bottom_gain} "
+                f"cyan={best['cyan_pixels']} blue={best['blue_pixels']}"
+            ),
+            (5, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        with data_lock:
+            shared_data['chasing_lost_frames'] += 1
+            if shared_data['chasing_lost_frames'] >= CHASE_MEMORY_LOST_FRAMES:
+                shared_data['chasing_prev_area'] = 0.0
+                shared_data['chasing_prev_bottom_y'] = 0
+                shared_data['chasing_prev_center_x'] = None
+
+        cv2.putText(
+            debug_frame,
+            "chase=NONE",
+            (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    debug_info = {
+        'seen': seen,
+        'reason': reason,
+        'box': best['box'] if best is not None else None,
+        'center_x': best['center_x'] if best is not None else None,
+        'bottom_y': best['bottom_y'] if best is not None else 0,
+        'area': best['area'] if best is not None else 0.0,
+        'score': best['score'] if best is not None else 0.0,
+        'approaching': approaching,
+        'already_close': already_close,
+        'area_gain': area_gain,
+        'bottom_gain': bottom_gain,
+        'debug_frame': debug_frame,
+    }
+
+    return seen, debug_info
+
 def processing_task():
     with data_lock:
         front_frame = shared_data['latest_front_frame']
@@ -1337,75 +1829,35 @@ def processing_task():
     frame_center = 160
     
     # ---------------------------------------------------------
-    # BACK CAMERA ENVIRONMENT ANALYSIS (Trailing Car Evasion) [cite: 31]
+    # BACK CAMERA ENVIRONMENT ANALYSIS (Chasing Car Detection)
     # ---------------------------------------------------------
     evade_back_car = False
     back_steering_escape = 0.0
-    
+
     if back_frame is not None:
-        small_back = cv2.resize(back_frame, (320, 240))
-        gray_back = cv2.cvtColor(small_back, cv2.COLOR_BGR2GRAY)
-        
-        # Check for proximity of a trailing vehicle via structural changes or looming bounding boxes
-        # Assuming vehicles from behind appear prominently in a specific mid-lane mask area
-        back_roi = gray_back[120:240, 60:260]
-        avg_intensity = np.mean(back_roi)
-        contrast = np.std(back_roi)
-        edge_density = 0.0
-        lower_edge_density = 0.0
-        upper_edge_density = 0.0
-        contours = []
-
-        # Brightness alone was too sensitive, so require stronger brightness + contrast.
-        if (avg_intensity > 225 or avg_intensity < 25) and contrast > 18:
-        
-            blurred_back_roi = cv2.GaussianBlur(back_roi, (5, 5), 0)
-            rear_edges = cv2.Canny(blurred_back_roi, 45, 135)
-            edge_density = cv2.countNonZero(rear_edges) / float(back_roi.size)
-            lower_edges = rear_edges[60:120, :]
-            upper_edges = rear_edges[0:60, :]
-            lower_edge_density = cv2.countNonZero(lower_edges) / float(lower_edges.size)
-            upper_edge_density = cv2.countNonZero(upper_edges) / float(upper_edges.size)
-
-            edge_kernel = np.ones((5, 5), np.uint8)
-            connected_edges = cv2.dilate(rear_edges, edge_kernel, iterations=2)
-            contours, _ = cv2.findContours(
-                connected_edges,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE,
-        )
-
-        largest_edge_blob = 0
-        lowest_blob_bottom = 0
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            area = cv2.contourArea(contour)
-            aspect_ratio = w / float(max(h, 1))
-            if 0.45 <= aspect_ratio <= 4.5 and area > largest_edge_blob:
-                largest_edge_blob = area
-                lowest_blob_bottom = y + h
-
-        rear_car_signal, rear_signal_reason = evaluate_trailing_signal(
-            avg_intensity,
-            contrast,
-            edge_density,
-            lower_edge_density,
-            upper_edge_density,
-            largest_edge_blob,
-            lowest_blob_bottom,
-        )
+        chase_seen, chase_debug = detect_back_chasing_car(back_frame)
 
         with data_lock:
             if shared_data['trailing_escape_cooldown'] > 0:
                 shared_data['trailing_escape_cooldown'] -= 1
 
-            if rear_car_signal:
+            if chase_seen:
                 shared_data['trailing_detect_count'] += 1
             else:
                 shared_data['trailing_detect_count'] = 0
 
-            shared_data['trailing_debug_tick'] = (shared_data['trailing_debug_tick'] + 1) % 30
+            shared_data['chasing_car_seen'] = chase_seen
+            shared_data['chasing_car_score'] = chase_debug.get('score', 0.0)
+            shared_data['chasing_car_box'] = chase_debug.get('box')
+            shared_data['chasing_car_reason'] = chase_debug.get('reason', 'NONE')
+            shared_data['debug_back_frame'] = chase_debug.get('debug_frame')
+
+            shared_data['trailing_debug_tick'] = (
+                shared_data['trailing_debug_tick'] + 1
+            ) % 30
+
             should_print_watch = shared_data['trailing_debug_tick'] == 0
+
             confirmed_rear_car = (
                 shared_data['trailing_detect_count'] >= TRAILING_CONFIRM_FRAMES
                 and shared_data['trailing_escape_cooldown'] == 0
@@ -1413,29 +1865,33 @@ def processing_task():
 
         if should_print_watch:
             print(
-                "Trailing Watch: "
+                "Chasing Watch: "
                 f"{TRAILING_DEBUG_VERSION} "
-                f"avg={avg_intensity:.1f}, contrast={contrast:.1f}, "
-                f"edges={edge_density:.3f}, lower={lower_edge_density:.3f}, "
-                f"blob={largest_edge_blob:.0f}, bottom={lowest_blob_bottom}, "
-                f"reason={rear_signal_reason}, "
-                f"signal={rear_car_signal}, cooldown={shared_data['trailing_escape_cooldown']}"
+                f"seen={chase_seen}, "
+                f"score={chase_debug.get('score', 0.0):.0f}, "
+                f"bottom={chase_debug.get('bottom_y', 0)}, "
+                f"center_x={chase_debug.get('center_x', None)}, "
+                f"reason={chase_debug.get('reason', 'NONE')}"
             )
 
         if confirmed_rear_car:
             evade_back_car = True
-            # Check which side has more space or default a structural escape jump
-            back_steering_escape = 1.0  # Tap right to clear the lane [cite: 153, 156]
+
             with data_lock:
                 current_lane_for_escape = shared_data.get('current_lane', 1)
-            back_steering_escape = choose_trailing_escape_direction(current_lane_for_escape)
+
+            back_steering_escape = choose_trailing_escape_direction(
+                current_lane_for_escape,
+                chase_debug.get('center_x')
+            )
+
             print(
-                "Trailing Car Alert! "
+                "Chasing Car Alert! "
                 f"{TRAILING_DEBUG_VERSION} "
-                f"avg={avg_intensity:.1f}, contrast={contrast:.1f}, "
-                f"edges={edge_density:.3f}, lower={lower_edge_density:.3f}, "
-                f"blob={largest_edge_blob:.0f}, bottom={lowest_blob_bottom}, "
-                f"reason={rear_signal_reason}, steering={back_steering_escape}"
+                f"score={chase_debug.get('score', 0.0):.0f}, "
+                f"bottom={chase_debug.get('bottom_y', 0)}, "
+                f"center_x={chase_debug.get('center_x', None)}, "
+                f"steering={back_steering_escape}"
             )
 
     # ---------------------------------------------------------
@@ -1448,9 +1904,9 @@ def processing_task():
         # ---------------------------------------------------------
         # NEW: Darkness Improvement
         # ---------------------------------------------------------
-        gray_front = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-        brightness = float(np.mean(gray_front))
-        low_brightness = update_darkness_state(brightness)
+        brightness_info = estimate_front_darkness_metric(small_frame)
+        brightness = brightness_info['metric']
+        low_brightness = update_darkness_state(brightness, brightness_info)
         critical_darkness = (
             low_brightness and brightness < CRITICAL_DARKNESS_THRESHOLD
         )
@@ -1543,9 +1999,14 @@ def processing_task():
             mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, DARK_KERNEL)
         
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         filtered_red_contours = [
             contour for contour in contours_red
             if is_token_like_contour(contour, 'R')
+        ]
+        filtered_yellow_contours = [
+            contour for contour in contours_yellow
+            if is_token_like_contour(contour, 'Y')
         ]
 
         # ---------------------------------------------------------
@@ -1602,6 +2063,22 @@ def processing_task():
                 lane_states[i] = 'Danger'
             elif not critical_darkness and valid_green:
                 lane_states[i] = 'Target'
+
+        # Wider look-ahead danger pass. Red/yellow always overrides green.
+        # This reduces red-token collection when red tokens are slightly before
+        # or after the thin proximity scan line.
+        danger_lanes_from_red = mark_danger_lanes_from_token_contours(
+            lane_states,
+            filtered_red_contours,
+            'R',
+        )
+        danger_lanes_from_yellow = mark_danger_lanes_from_token_contours(
+            lane_states,
+            filtered_yellow_contours,
+            'Y',
+        )
+        danger_lanes_from_tokens = danger_lanes_from_red | danger_lanes_from_yellow
+
         police_candidate_box = police_debug.get('candidate_box')
         police_raw_box = police_debug.get('raw_candidate_box')
         police_detected_now = False
@@ -1724,6 +2201,7 @@ def processing_task():
 
         police_urgent_avoidance = False
         police_red_chase_active = False
+        red_emergency_avoidance = False
 
         # Decision State Hierarchy [cite: 15]
         if (
@@ -1836,6 +2314,7 @@ def processing_task():
             best_lane = ego_lane
             
             if current_state == 'Danger':
+                red_emergency_avoidance = True
                 # Need to escape. Find nearest Target or Clear lane
                 min_dist = float('inf')
                 for priority in ['Target', 'Clear']:
@@ -1857,6 +2336,16 @@ def processing_task():
                             min_dist = dist
                             best_lane = i
                             
+            # If the centre lane is dangerous but all lanes look bad, still move away.
+            if red_emergency_avoidance and best_lane == ego_lane:
+                left_score = 0
+                right_score = 0
+                if ego_lane - 1 >= 0 and lane_states[ego_lane - 1] != 'Danger':
+                    left_score += 1
+                if ego_lane + 1 < NUM_LANES and lane_states[ego_lane + 1] != 'Danger':
+                    right_score += 1
+                best_lane = ego_lane - 1 if left_score >= right_score and ego_lane > 0 else min(NUM_LANES - 1, ego_lane + 1)
+
             # Fire Steering Commands
             if best_lane < ego_lane:
                 steering_target = -1.0
@@ -1888,7 +2377,6 @@ def processing_task():
                 shared_data['trailing_detect_count'] = 0
                 shared_data['trailing_escape_cooldown'] = TRAILING_ESCAPE_COOLDOWN_FRAMES
                 shared_data['trailing_escape_send_timer'] = TRAILING_TAP_FRAMES
-                shared_data['light_signal_timer'] = 0
                 lane_delta = -1 if back_steering_escape < 0 else 1
                 shared_data['target_lane'] = int(np.clip(shared_data.get('current_lane', 1) + lane_delta, 0, 2))
                 shared_data['current_lane'] = shared_data['target_lane']
@@ -1915,6 +2403,15 @@ def processing_task():
                 shared_data['cooldown_timer'] = 0
                 shared_data['steering_input'] = steering_target
                 print(f"Initiating Police Red Chase Tap! Steering: {steering_target}")
+            elif red_emergency_avoidance and steering_target != 0.0:
+                # Red/yellow in the current lane has priority over the normal
+                # tap/cooldown rhythm. Otherwise the car often reaches the token
+                # before the next tap is allowed.
+                shared_data['tap_steering'] = steering_target
+                shared_data['tap_timer'] = RED_EMERGENCY_TAP_FRAMES
+                shared_data['cooldown_timer'] = 0
+                shared_data['steering_input'] = steering_target
+                print(f"Emergency Red/Yellow Avoid Tap! Steering: {steering_target}")
             elif shared_data['tap_timer'] > 0:
                 # State 1: Actively tapping [cite: 156]
                 shared_data['tap_timer'] -= 1
@@ -2063,7 +2560,7 @@ def processing_task():
             (
                 f"mode={'DARKNESS' if low_brightness else 'NORMAL'} | "
                 f"light={overlay_light_state} | "
-                f"brightness={brightness:.1f}"
+                f"metric={brightness:.1f} road={brightness_info['road_mean']:.1f}"
             ),
             (5, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -2169,51 +2666,55 @@ def processing_task():
 def send_controls_task():
     global control_conn
     if control_conn is None:
-        # Workaround: Safely restart the locked server function if it died
-        is_server_running = any(t.name == "ControlServerRecovery" for t in threading.enumerate())
+        is_server_running = any(
+            t.name == "ControlServerRecovery"
+            for t in threading.enumerate()
+        )
         if not is_server_running:
             print("Connection missing. Restarting control server...")
-            threading.Thread(target=setup_control_server, name="ControlServerRecovery", daemon=True).start()
+            threading.Thread(
+                target=setup_control_server,
+                name="ControlServerRecovery",
+                daemon=True
+            ).start()
         return
-    
+
     with data_lock:
         steering_to_send = shared_data['steering_input']
         police_avoid_active = shared_data['police_avoid_timer'] > 0
         police_avoid_acceleration = shared_data['police_avoid_acceleration']
         trailing_escape_active = shared_data['trailing_escape_send_timer'] > 0
-        if trailing_escape_active:
-            shared_data['trailing_escape_send_timer'] -= 1
-            shared_data['light_signal_timer'] = 0
-        # NEW: Darkness Improvement
-        # Unity treats acceleration -1.0 during darkness as the light recovery command.
-        if trailing_escape_active:
-            shared_data['trailing_escape_send_timer'] -= 1
 
-        # Highest priority: EV1 requires acceleration_input = -1.0 to brake/open light.
-        # Do not let trailing/police logic cancel the light command.
+        # EV1 Darkness light/brake pulse is only a short pulse.
         if shared_data['light_signal_timer'] > 0:
             shared_data['light_signal_timer'] -= 1
             steering_to_send = 0.0
             acceleration_to_send = LIGHT_TOGGLE_ACCELERATION
+
+        # EV3/EV4 chasing escape must override darkness slow speed.
+        # If we keep acceleration at 0.15/0.35, the car cannot complete the lane change.
+        elif trailing_escape_active:
+            shared_data['trailing_escape_send_timer'] -= 1
+            steering_to_send = shared_data['tap_steering']
+            acceleration_to_send = TRAILING_ESCAPE_ACCELERATION
+
+        elif police_avoid_active:
+            acceleration_to_send = police_avoid_acceleration
+
         elif shared_data['low_brightness']:
             if shared_data['front_brightness'] < CRITICAL_DARKNESS_THRESHOLD:
                 acceleration_to_send = CRITICAL_DARKNESS_ACCELERATION
             else:
                 acceleration_to_send = DARKNESS_ACCELERATION
-        elif trailing_escape_active:
-            steering_to_send = shared_data['tap_steering']
-            acceleration_to_send = 1.0
-        elif police_avoid_active:
-            acceleration_to_send = police_avoid_acceleration
+
         else:
             acceleration_to_send = 1.0
 
     try:
-        # Pack and send the control command to Unity [cite: 177]
         data = struct.pack('ff', steering_to_send, acceleration_to_send)
         control_conn.sendall(data)
     except Exception as e:
-        print(f"Control send error: {e}") 
+        print(f"Control send error: {e}")
         control_conn = None
 
 
@@ -2257,12 +2758,14 @@ if __name__ == '__main__':
                 front = shared_data.get('latest_front_frame')
                 debug_front = shared_data.get('debug_front_frame')
                 back = shared_data.get('latest_back_frame')
+                debug_back = shared_data.get('debug_back_frame')
 
             front_to_show = debug_front if debug_front is not None else front
             if front_to_show is not None:
                 cv2.imshow("Front Camera - AI Driving", cv2.resize(front_to_show, (640, 480)))
-            if back is not None:
-                cv2.imshow("Back Camera", cv2.resize(back, (640, 480)))
+            back_to_show = debug_back if debug_back is not None else back
+            if back_to_show is not None:
+                cv2.imshow("Back Camera", cv2.resize(back_to_show, (640, 480)))
 
             key = cv2.waitKey(33) & 0xFF
 
