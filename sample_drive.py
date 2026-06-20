@@ -142,6 +142,11 @@ TOKEN_MAX_AREA = 1800
 TOKEN_MAX_DIMENSION = 64
 TOKEN_MIN_CIRCULARITY = 0.45
 TOKEN_MIN_FILL_RATIO = 0.34
+TOKEN_MIN_RADIUS = 15
+TOKEN_MAX_RADIUS = 30
+TOKEN_HORIZONTAL_ELONGATION = 1.45
+TOKEN_HORIZONTAL_ANGLE_DEGREES = 20.0
+TOKEN_MIN_FORWARD_ANGLE_DEGREES = 30.0
 RIGHT_SHOULDER_REJECT_MARGIN = 18
 
 # ---------------------------------------------------------
@@ -570,6 +575,20 @@ def token_contour_metrics(contour):
         circularity = float((4.0 * np.pi * area) / (perimeter * perimeter))
     fill_ratio = area / float(max(w * h, 1))
 
+    pca_angle = None
+    pca_elongation = 1.0
+    points = contour.reshape(-1, 2).astype(np.float32)
+    if len(points) >= 5:
+        centered_points = points - np.mean(points, axis=0)
+        covariance = np.cov(centered_points, rowvar=False)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        order = np.argsort(eigenvalues)[::-1]
+        major_value = float(max(eigenvalues[order[0]], 1e-6))
+        minor_value = float(max(eigenvalues[order[1]], 1e-6))
+        major_vector = eigenvectors[:, order[0]]
+        pca_angle = abs(float(np.degrees(np.arctan2(major_vector[1], major_vector[0])))) % 180.0
+        pca_elongation = float(np.sqrt(major_value / minor_value))
+
     M = cv2.moments(contour)
     if M['m00'] > 0:
         center_x = int(M['m10'] / M['m00'])
@@ -591,6 +610,8 @@ def token_contour_metrics(contour):
         'cy': center_y,
         'bottom': y + h,
         'radius': radius,
+        'pca_angle': pca_angle,
+        'pca_elongation': pca_elongation,
     }
 
 
@@ -624,6 +645,26 @@ def object_gate_reason(
 
     if metrics['area'] < min_area or metrics['area'] > max_area:
         return 'size'
+
+    if shape_kind == 'round' and metrics['radius'] < TOKEN_MIN_RADIUS:
+        return 'size'
+
+    if shape_kind == 'round' and metrics['radius'] > TOKEN_MAX_RADIUS:
+        return 'size'
+
+    if shape_kind == 'round':
+        aspect_ratio = metrics['w'] / float(max(metrics['h'], 1))
+        if aspect_ratio > 2.0:
+            return 'horizontal-line'
+
+        pca_angle = metrics.get('pca_angle')
+        if pca_angle is not None:
+            near_horizontal = (
+                pca_angle <= TOKEN_HORIZONTAL_ANGLE_DEGREES
+                or pca_angle >= 180.0 - TOKEN_HORIZONTAL_ANGLE_DEGREES
+            )
+            if metrics.get('pca_elongation', 1.0) >= TOKEN_HORIZONTAL_ELONGATION and near_horizontal:
+                return 'horizontal-angle'
 
     if max(metrics['w'], metrics['h']) > TOKEN_MAX_DIMENSION and shape_kind == 'round':
         return 'size'
@@ -680,6 +721,17 @@ def is_centroid_inside_token_road_roi(center_x, center_y, road_mask=None):
     return True
 
 
+
+def token_forward_angle_degrees(metrics):
+    """Angle from the car to a token, measured up from the horizontal."""
+    car_x = 160.0
+    car_y = float(ROAD_BOTTOM_Y - 8)
+    dx = abs(float(metrics['cx']) - car_x)
+    forward = car_y - float(metrics['cy'])
+    if forward <= 0.0:
+        return 0.0
+    return float(np.degrees(np.arctan2(forward, max(dx, 1.0))))
+
 def token_rejection_reason(contour, color_code=None, road_mask=None):
     metrics = token_contour_metrics(contour)
     reason = object_gate_reason(
@@ -691,6 +743,9 @@ def token_rejection_reason(contour, color_code=None, road_mask=None):
     )
     if reason is not None:
         return reason
+
+    if token_forward_angle_degrees(metrics) < TOKEN_MIN_FORWARD_ANGLE_DEGREES:
+        return 'side-angle'
 
     if metrics['bottom'] >= EGO_IGNORE_TOP and EGO_IGNORE_LEFT <= metrics['cx'] <= EGO_IGNORE_RIGHT:
         return 'ego-car'
