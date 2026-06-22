@@ -143,10 +143,12 @@ TOKEN_MAX_DIMENSION = 64
 TOKEN_MIN_CIRCULARITY = 0.45
 TOKEN_MIN_FILL_RATIO = 0.34
 TOKEN_MIN_RADIUS = 15
-TOKEN_MAX_RADIUS = 30
+TOKEN_MAX_RADIUS = 80
 TOKEN_HORIZONTAL_ELONGATION = 1.45
 TOKEN_HORIZONTAL_ANGLE_DEGREES = 20.0
 TOKEN_MIN_FORWARD_ANGLE_DEGREES = 30.0
+TOKEN_REACT_FORWARD_ANGLE_DEGREES = 60.0
+GREEN_CENTER_DEADZONE_PIXELS = 8
 RIGHT_SHOULDER_REJECT_MARGIN = 18
 
 # ---------------------------------------------------------
@@ -169,6 +171,7 @@ GOLDEN_BANNER_MIN_AREA = 450
 GOLDEN_BANNER_MIN_WIDTH = 90
 GOLDEN_YELLOW_LOWER = np.array([16, 70, 90])
 GOLDEN_YELLOW_UPPER = np.array([40, 255, 255])
+GOLDEN_COLOR_BGR = (77, 233, 243)
 GOLDEN_BLACK_UPPER_VALUE = 160
 GOLDEN_LANE_TEMPLATES = None
 LANE_SETTLE_FRAMES = 10
@@ -732,6 +735,47 @@ def token_forward_angle_degrees(metrics):
         return 0.0
     return float(np.degrees(np.arctan2(forward, max(dx, 1.0))))
 
+
+def choose_closest_reactive_token(token_observations):
+    """Pick the closest token that is meaningfully in front of the car."""
+    reactive_tokens = []
+    for token in token_observations:
+        forward_angle = token_forward_angle_degrees(token)
+        if forward_angle < TOKEN_REACT_FORWARD_ANGLE_DEGREES:
+            continue
+        token_with_angle = dict(token)
+        token_with_angle['forward_angle'] = forward_angle
+        reactive_tokens.append(token_with_angle)
+
+    if not reactive_tokens:
+        return None
+
+    return max(
+        reactive_tokens,
+        key=lambda item: (item['bottom'], item['forward_angle'], item['radius']),
+    )
+
+def choose_closest_reactive_tokens(token_observations):
+    """Pick the 2 closest tokens that are meaningfully in front of the car."""
+    reactive_tokens = []
+    for token in token_observations:
+        forward_angle = token_forward_angle_degrees(token)
+        if forward_angle < TOKEN_REACT_FORWARD_ANGLE_DEGREES:
+            continue
+        token_with_angle = dict(token)
+        token_with_angle['forward_angle'] = forward_angle
+        reactive_tokens.append(token_with_angle)
+
+    if not reactive_tokens:
+        return []
+
+    sorted_tokens = sorted(
+        reactive_tokens,
+        key=lambda item: (item['bottom'], item['forward_angle'], item['radius']),
+        reverse=True
+    )
+    return sorted_tokens[:2]
+
 def token_rejection_reason(contour, color_code=None, road_mask=None):
     metrics = token_contour_metrics(contour)
     reason = object_gate_reason(
@@ -793,6 +837,7 @@ def collect_token_observations(contours, color_code, road_mask=None, max_area=No
             'h': h,
             'cx': center_x,
             'cy': center_y,
+            'bottom': bottom_y,
             'radius': max(3, int(round(metrics['radius']))),
             'confidence': min(1.0, max(0.0, metrics['circularity'])),
             'lane': pixel_x_to_debug_lane(center_x, bottom_y),
@@ -905,118 +950,48 @@ def build_golden_lane_templates():
 
 def detect_golden_lane_event(frame):
     """
-    OpenCV-only Golden Lane reader.
-
-    1. Find the yellow HUD banner in the top of the image.
-    2. Extract only dark/black lettering inside that yellow rectangle.
-    3. Template-match LANE 1 through LANE 5 against the extracted text.
-
-    Timer anchor: detection time, because this script has no simulator event
-    timestamp channel for EV5.
+    Detect golden lane by finding the specific yellow color rgba(243, 233, 77).
+    Determine lane (0-4) based on horizontal position of the detected color region.
     """
-    global GOLDEN_LANE_TEMPLATES
-    if GOLDEN_LANE_TEMPLATES is None:
-        GOLDEN_LANE_TEMPLATES = build_golden_lane_templates()
-
     top_bar = frame[GOLDEN_LANE_TOP:GOLDEN_LANE_BOTTOM, :]
     if top_bar.size == 0:
         return None, 0.0
 
-    top_hsv = cv2.cvtColor(top_bar, cv2.COLOR_BGR2HSV)
-    yellow_mask = cv2.inRange(top_hsv, GOLDEN_YELLOW_LOWER, GOLDEN_YELLOW_UPPER)
-    yellow_mask = cv2.morphologyEx(
-        yellow_mask,
-        cv2.MORPH_CLOSE,
-        np.ones((5, 9), np.uint8),
-        iterations=2,
-    )
+    color_lower = np.array([max(0, c - 15) for c in GOLDEN_COLOR_BGR])
+    color_upper = np.array([min(255, c + 15) for c in GOLDEN_COLOR_BGR])
+
+    color_mask = cv2.inRange(top_bar, color_lower, color_upper)
+
     contours, _ = cv2.findContours(
-        yellow_mask,
+        color_mask,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE,
     )
-    banner_box = None
-    banner_score = -1.0
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        x, y, w, h = cv2.boundingRect(contour)
-        if area < GOLDEN_BANNER_MIN_AREA or w < GOLDEN_BANNER_MIN_WIDTH or h < 10:
-            continue
-        fill = area / float(max(w * h, 1))
-        score = area * fill
-        if score > banner_score:
-            banner_score = score
-            banner_box = (x, y, w, h)
 
-    # No yellow region means this cannot be the Golden Lane message. This is
-    # the important false-positive guard missing from whole-HUD edge matching.
-    if banner_box is None:
+    if not contours:
         return None, 0.0
 
-    x, y, w, h = banner_box
-    pad_x = max(2, int(w * 0.02))
-    pad_y = max(1, int(h * 0.08))
-    x1, x2 = max(0, x + pad_x), min(top_bar.shape[1], x + w - pad_x)
-    y1, y2 = max(0, y + pad_y), min(top_bar.shape[0], y + h - pad_y)
-    banner_hsv = top_hsv[y1:y2, x1:x2]
-    if banner_hsv.size == 0:
+    best_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(best_contour)
+
+    if area < 50:
         return None, 0.0
 
-    # Black text may have antialiased grey edge pixels. Hue/saturation are not
-    # useful for black, so extract it by value while remaining inside the
-    # already-confirmed yellow banner rectangle.
-    black_text = cv2.inRange(
-        banner_hsv,
-        np.array([0, 0, 0]),
-        np.array([180, 255, GOLDEN_BLACK_UPPER_VALUE]),
-    )
-    if cv2.countNonZero(black_text) < 18:
+    M = cv2.moments(best_contour)
+    if M['m00'] == 0:
         return None, 0.0
-    component_count, _, stats, _ = cv2.connectedComponentsWithStats(black_text, 8)
-    characters = []
-    for component in range(1, component_count):
-        cx, cy, cw, ch, area = stats[component]
-        if area >= 3 and ch >= 6 and cw >= 1:
-            characters.append((cx, cy, cw, ch, area))
-    characters.sort(key=lambda item: item[0])
 
-    # The validated message starts with "LANE X". Font antialiasing can join
-    # neighbouring letters, so find the first word-space rather than assuming
-    # a fixed component number; the component after that gap is X.
-    if len(characters) < 3:
-        return None, 0.0
-    widths = [item[2] for item in characters[:6]]
-    gap_threshold = max(4.0, float(np.median(widths)) * 0.45)
-    digit_component = None
-    for index in range(1, min(len(characters), 7)):
-        previous_right = characters[index - 1][0] + characters[index - 1][2]
-        gap = characters[index][0] - previous_right
-        if gap >= gap_threshold:
-            digit_component = characters[index]
-            break
-    if digit_component is None:
-        return None, 0.0
-    gx, gy, gw, gh, _ = digit_component
-    digit = black_text[gy:gy + gh, gx:gx + gw]
-    digit = cv2.resize(digit, (18, 26), interpolation=cv2.INTER_AREA)
-    _, digit = cv2.threshold(digit, 80, 255, cv2.THRESH_BINARY)
+    cx = int(M['m10'] / M['m00'])
 
-    best_lane = None
-    best_score = 0.0
-    for template in GOLDEN_LANE_TEMPLATES:
-        tmpl = template['image']
-        match = cv2.matchTemplate(digit, tmpl, cv2.TM_CCOEFF_NORMED)
-        score = float(match[0, 0])
-        if score > best_score:
-            best_score = score
-            best_lane = template['shown_lane']
+    frame_width = top_bar.shape[1]
+    lane_width = frame_width / 5.0
+    detected_lane = int(cx / lane_width)
+    detected_lane = min(4, max(0, detected_lane))
 
-    if best_lane is None or best_score < GOLDEN_LANE_MATCH_THRESHOLD:
-        return None, best_score
+    confidence = min(1.0, area / 1000.0)
 
-    # In-game text is 1-based ("LANE 4"); internal/HUD lanes are L0-L4.
-    internal_lane_index = int(best_lane) - 1
-    return int(np.clip(internal_lane_index, 0, NUM_LANES - 1)), best_score
+    return detected_lane, confidence
+
 
 
 def update_golden_lane_state(small_frame):
@@ -2711,11 +2686,16 @@ def processing_task():
             + collect_token_observations(filtered_yellow_contours, 'Y', road_mask)
         )
         nearest_token_observation = None
+        closest_reactive_tokens = []
         if token_observations:
             nearest_token_observation = max(
                 token_observations,
                 key=lambda item: (item['cy'], item['y'] + item['h']),
             )
+        closest_reactive_tokens = choose_closest_reactive_tokens(token_observations)
+        if closest_reactive_tokens:
+            nearest_token_observation = closest_reactive_tokens[0]
+
 
         # ---------------------------------------------------------
         # FIXED: Proximity Scan Line - 5 Bucket Bounding Boxes
@@ -3011,61 +2991,134 @@ def processing_task():
 
         elif golden_lane_active and golden_lane_target is not None:
             action_kind = 'golden'
-            ego_lane = NUM_LANES // 2
-            if golden_lane_target < ego_lane:
+            frame_in_phase = shared_data.get('golden_lane_timer', GOLDEN_LANE_EVENT_FRAMES)
+            elapsed_frames = GOLDEN_LANE_EVENT_FRAMES - frame_in_phase
+
+            if golden_lane_target == 0:
                 steering_target = -1.0
-            elif golden_lane_target > ego_lane:
+            elif golden_lane_target == 1:
+                pattern = [-1.0, -1.0, -1.0, -1.0, -1.0, 1.0]
+                steering_target = pattern[elapsed_frames % 6]
+            elif golden_lane_target == 2:
+                pattern = [-1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0]
+                steering_target = pattern[elapsed_frames % 7]
+            elif golden_lane_target == 3:
+                pattern = [1.0, 1.0, 1.0, 1.0, 1.0, -1.0]
+                steering_target = pattern[elapsed_frames % 6]
+            elif golden_lane_target == 4:
                 steering_target = 1.0
             else:
                 steering_target = 0.0
 
-        else:
-            # Priority 3: Standard Navigation using the 5-Bucket Logic Engine
-            ego_lane = 2  # The camera is fixed to the car, so the car is always in lane 2
-            current_state = lane_states[ego_lane]
-            best_lane = ego_lane
-            
-            if current_state == 'Danger':
-                red_emergency_avoidance = True
-                action_kind = 'red_yellow'
-                # Need to escape. Find nearest Target or Clear lane
-                min_dist = float('inf')
-                for priority in ['Target', 'Clear']:
-                    for i, state in enumerate(lane_states):
-                        if state == priority:
-                            dist = abs(i - ego_lane)
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_lane = i
-                    if best_lane != ego_lane:
-                        break
-            elif current_state == 'Clear':
-                # Safe, but look for a Target (Green) lane
-                min_dist = float('inf')
-                for i, state in enumerate(lane_states):
-                    if state == 'Target':
-                        dist = abs(i - ego_lane)
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_lane = i
-                            
-            # If the centre lane is dangerous but all lanes look bad, still move away.
-            if red_emergency_avoidance and best_lane == ego_lane:
-                left_score = 0
-                right_score = 0
-                if ego_lane - 1 >= 0 and lane_states[ego_lane - 1] != 'Danger':
-                    left_score += 1
-                if ego_lane + 1 < NUM_LANES and lane_states[ego_lane + 1] != 'Danger':
-                    right_score += 1
-                best_lane = ego_lane - 1 if left_score >= right_score and ego_lane > 0 else min(NUM_LANES - 1, ego_lane + 1)
+            print(
+                f"Golden lane {golden_lane_target + 1}: steer={steering_target} "
+                f"frame={elapsed_frames}/{GOLDEN_LANE_EVENT_FRAMES}"
+            )
 
-            # Fire Steering Commands
-            if best_lane < ego_lane:
-                steering_target = -1.0
-                print(f"Logic Engine: Steering LEFT to Lane {best_lane}")
-            elif best_lane > ego_lane:
-                steering_target = 1.0
-                print(f"Logic Engine: Steering RIGHT to Lane {best_lane}")
+        else:
+            # Priority 3: closest forward tokens win. The camera is fixed to
+            # the car, so tokens straight ahead trigger avoidance or following.
+            ego_lane = NUM_LANES // 2
+            best_lane = ego_lane
+
+            if closest_reactive_tokens:
+                token1 = closest_reactive_tokens[0]
+                token2 = closest_reactive_tokens[1] if len(closest_reactive_tokens) > 1 else None
+
+                token1_color = token1['color']
+                token1_error = token1['cx'] - frame_center
+                token1_angle = token1.get('forward_angle', 0.0)
+
+                if token2:
+                    token2_color = token2['color']
+                    token2_error = token2['cx'] - frame_center
+                    token2_angle = token2.get('forward_angle', 0.0)
+                else:
+                    token2_color = None
+                    token2_error = None
+
+                if token1_color in ('R', 'Y'):
+                    red_emergency_avoidance = True
+                    action_kind = 'red_yellow'
+                    if token2 and token2_color in ('R', 'Y'):
+                        mid_point = (token1_error + token2_error) / 2.0
+                        steering_target = -1.0 if mid_point > 0 else 1.0
+                        print(
+                            "Two red/yellow tokens: "
+                            f"token1 angle={token1_angle:.0f} err={token1_error}, "
+                            f"token2 angle={token2_angle:.0f} err={token2_error}, "
+                            f"steer={steering_target}"
+                        )
+                    elif token2 and token2_color == 'G':
+                        if token2_error < 0:
+                            steering_target = -1.0
+                        else:
+                            steering_target = 1.0
+                        print(
+                            "Red token + Green target: "
+                            f"red angle={token1_angle:.0f} err={token1_error}, "
+                            f"green angle={token2_angle:.0f} err={token2_error}, "
+                            f"steer={steering_target}"
+                        )
+                    else:
+                        if abs(token1_error) <= 4:
+                            left_safe = ego_lane - 1 >= 0 and lane_states[ego_lane - 1] != 'Danger'
+                            right_safe = ego_lane + 1 < NUM_LANES and lane_states[ego_lane + 1] != 'Danger'
+                            steering_target = -1.0 if left_safe or not right_safe else 1.0
+                        else:
+                            steering_target = -1.0 if token1_error > 0 else 1.0
+                        print(
+                            "Red/yellow token: "
+                            f"angle={token1_angle:.0f} err={token1_error}, steer={steering_target}"
+                        )
+                elif token1_color == 'G':
+                    action_kind = 'normal'
+                    if abs(token1_error) <= GREEN_CENTER_DEADZONE_PIXELS:
+                        steering_target = 0.0
+                        green_action = 'maintain'
+                    elif token1_error < 0:
+                        steering_target = -1.0
+                        green_action = 'move-left'
+                    else:
+                        steering_target = 1.0
+                        green_action = 'move-right'
+                    print(
+                        "Green target: "
+                        f"angle={token1_angle:.0f} err={token1_error}, "
+                        f"action={green_action}, steer={steering_target}"
+                    )
+            else:
+                current_state = lane_states[ego_lane]
+
+                if current_state == 'Danger':
+                    red_emergency_avoidance = True
+                    action_kind = 'red_yellow'
+                    min_dist = float('inf')
+                    for priority in ['Target', 'Clear']:
+                        for i, state in enumerate(lane_states):
+                            if state == priority:
+                                dist = abs(i - ego_lane)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_lane = i
+                        if best_lane != ego_lane:
+                            break
+
+                if red_emergency_avoidance and best_lane == ego_lane:
+                    left_score = 0
+                    right_score = 0
+                    if ego_lane - 1 >= 0 and lane_states[ego_lane - 1] != 'Danger':
+                        left_score += 1
+                    if ego_lane + 1 < NUM_LANES and lane_states[ego_lane + 1] != 'Danger':
+                        right_score += 1
+                    best_lane = ego_lane - 1 if left_score >= right_score and ego_lane > 0 else min(NUM_LANES - 1, ego_lane + 1)
+
+                if best_lane < ego_lane:
+                    steering_target = -1.0
+                    print(f"Fallback danger dodge: Steering LEFT to Lane {best_lane}")
+                elif best_lane > ego_lane:
+                    steering_target = 1.0
+                    print(f"Fallback danger dodge: Steering RIGHT to Lane {best_lane}")
 
         arbiter_action = choose_frame_action(
             action_kind,
@@ -3181,29 +3234,30 @@ def processing_task():
                 1,
                 cv2.LINE_AA,
             )
-        if nearest_token_observation is not None:
-            token_color = token_debug_colors.get(nearest_token_observation['color'], (0, 255, 0))
-            token_center = (
-                int(nearest_token_observation['cx']),
-                int(nearest_token_observation['cy']),
-            )
-            token_radius = int(nearest_token_observation['radius'])
-            cv2.line(
-                debug_frame,
-                car_debug_point,
-                token_center,
-                token_color,
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.circle(
-                debug_frame,
-                token_center,
-                token_radius,
-                token_color,
-                2,
-                cv2.LINE_AA,
-            )
+        if closest_reactive_tokens:
+            for i, token in enumerate(closest_reactive_tokens[:2]):
+                token_color = token_debug_colors.get(token['color'], (0, 255, 0))
+                token_center = (
+                    int(token['cx']),
+                    int(token['cy']),
+                )
+                token_radius = int(token['radius'])
+                cv2.line(
+                    debug_frame,
+                    car_debug_point,
+                    token_center,
+                    token_color,
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.circle(
+                    debug_frame,
+                    token_center,
+                    token_radius,
+                    token_color,
+                    2 if i == 0 else 1,
+                    cv2.LINE_AA,
+                )
 
         with data_lock:
             overlay_game_state = shared_data['race_game_state']
@@ -3502,5 +3556,6 @@ if __name__ == '__main__':
         control_conn.close()
     cv2.destroyAllWindows()
     print("System terminated cleanly.")
+
 
 
