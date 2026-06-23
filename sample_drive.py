@@ -369,6 +369,23 @@ class RTTask(threading.Thread):
         self.priority = priority
         self.execute_func = execute_func
         self.daemon = True
+        self.execution_count = 0
+        self.deadline_miss_count = 0
+        self.worst_execution_time = 0.0
+        self._last_deadline_warning = 0.0
+
+    def performance_summary(self):
+        """Return a compact scheduler summary for shutdown diagnostics."""
+        miss_rate = (
+            (self.deadline_miss_count / self.execution_count) * 100.0
+            if self.execution_count
+            else 0.0
+        )
+        return (
+            f"{self.name}: runs={self.execution_count}, "
+            f"misses={self.deadline_miss_count} ({miss_rate:.1f}%), "
+            f"worst={self.worst_execution_time * 1000:.1f}ms"
+        )
 
     def run(self):
         print(f"[{self.name}] Started | Period: {self.period}s | Priority: {self.priority}")
@@ -384,9 +401,24 @@ class RTTask(threading.Thread):
             pass
 
         while is_running:
-            start_time = time.time()
+            start_time = time.perf_counter()
             self.execute_func()
-            exec_time = time.time() - start_time
+            exec_time = time.perf_counter() - start_time
+            self.execution_count += 1
+            self.worst_execution_time = max(self.worst_execution_time, exec_time)
+
+            if exec_time > self.period:
+                self.deadline_miss_count += 1
+                now = time.monotonic()
+                # Throttle warnings so a busy task does not flood the console.
+                if now - self._last_deadline_warning >= 5.0:
+                    overrun_ms = (exec_time - self.period) * 1000.0
+                    print(
+                        f"[{self.name}] Deadline missed by {overrun_ms:.1f}ms "
+                        f"(total misses: {self.deadline_miss_count})"
+                    )
+                    self._last_deadline_warning = now
+
             sleep_time = self.period - exec_time
             
             if sleep_time > 0:
@@ -3546,6 +3578,10 @@ if __name__ == '__main__':
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
+
+    print("\n--- Real-Time Task Performance ---")
+    for task in (t_front_camera, t_back_camera, t_processing, t_controls):
+        print(task.performance_summary())
     
     # This is to close all the connections
     if front_camera_sock:
